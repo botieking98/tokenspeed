@@ -48,6 +48,18 @@ def _version(args: argparse.Namespace) -> None:
     print(f"TokenSpeed v{__version__}")
 
 
+def _router(args: argparse.Namespace) -> None:
+    from tokenspeed.runtime.router.lmetric_router import run
+
+    run(
+        instance_urls=args.instance_urls,
+        host=args.host,
+        port=args.port,
+        mode=args.mode,
+        prefix_window=args.prefix_window,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="tokenspeed",
@@ -82,6 +94,32 @@ def main() -> None:
         help="Print the TokenSpeed version.",
     )
     version_parser.set_defaults(func=_version)
+
+    router_parser = subparsers.add_parser(
+        "router",
+        help="Launch the LMetric multi-instance router.",
+    )
+    router_parser.add_argument(
+        "--instance-urls",
+        nargs="+",
+        required=True,
+        help="URLs of ts serve instances to route across.",
+    )
+    router_parser.add_argument("--host", default="0.0.0.0")
+    router_parser.add_argument("--port", type=int, default=9000)
+    router_parser.add_argument(
+        "--mode",
+        choices=["lmetric", "round_robin"],
+        default="lmetric",
+        help="Routing strategy (default: lmetric).",
+    )
+    router_parser.add_argument(
+        "--prefix-window",
+        type=int,
+        default=256,
+        help="Token window for prefix affinity hashing.",
+    )
+    router_parser.set_defaults(func=_router)
 
     args, extra_args = parser.parse_known_args()
 
