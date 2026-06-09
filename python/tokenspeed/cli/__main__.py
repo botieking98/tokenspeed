@@ -57,6 +57,8 @@ def _router(args: argparse.Namespace) -> None:
         port=args.port,
         mode=args.mode,
         prefix_window=args.prefix_window,
+        hit_discount=args.hit_discount,
+        max_load_ratio=args.max_load_ratio,
     )
 
 
@@ -118,6 +120,18 @@ def main() -> None:
         type=int,
         default=256,
         help="Token window for prefix affinity hashing.",
+    )
+    router_parser.add_argument(
+        "--hit-discount",
+        type=float,
+        default=0.5,
+        help="Cache hit discount factor (0.5 = halved prefill cost estimate).",
+    )
+    router_parser.add_argument(
+        "--max-load-ratio",
+        type=float,
+        default=2.0,
+        help="Max inflight ratio before forcing load balance over cache affinity.",
     )
     router_parser.set_defaults(func=_router)
 

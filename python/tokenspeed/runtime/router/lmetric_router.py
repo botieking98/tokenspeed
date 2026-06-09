@@ -52,13 +52,18 @@ _HEALTH_CHECK_INTERVAL = 5.0
 class PrefixAffinityTracker:
     """Track which instance likely has a given prefix cached.
 
-    Uses a hash of the first ``prefix_window`` tokens to identify shared
-    prefixes. Maintains a routing history: if prefix P was last routed to
-    instance I, that instance likely has P in its KV cache.
+    Uses a hash of the first ``prefix_window`` characters of the prompt to
+    identify shared prefixes. Maintains a routing history: if prefix P was
+    last routed to instance I, that instance likely has P in its KV cache.
+
+    The cache-hit discount is controlled by ``hit_discount``: a value of 0.5
+    means a cache hit halves the estimated new_prefill_tokens (not near-zero).
+    This prevents over-concentrating requests on one instance.
     """
 
-    def __init__(self, prefix_window: int = 256):
+    def __init__(self, prefix_window: int = 256, hit_discount: float = 0.5):
         self.prefix_window = prefix_window
+        self.hit_discount = hit_discount
         # prefix_hash -> (instance_idx, last_routed_time)
         self._affinity: dict[str, tuple[int, float]] = {}
         self._ttl = 300.0  # 5 min — cache entries evict after this
@@ -88,15 +93,13 @@ class PrefixAffinityTracker:
     ) -> int:
         """Estimate new prefill tokens if routed to instance_idx.
 
-        If this prefix was recently routed to instance_idx, assume full cache
-        hit (new_prefill ≈ suffix only). Otherwise assume no cache hit
-        (new_prefill ≈ total_tokens).
+        Cache hit applies a discount (e.g. 0.5 = halved cost), not near-zero.
+        This keeps the load-balancing term meaningful even for cache-friendly
+        requests.
         """
         affinity = self.get_affinity(prompt_text)
         if affinity == instance_idx:
-            # Estimate: cached prefix covers ~prefix_window tokens worth,
-            # only the suffix needs prefill
-            return max(total_tokens_est - self.prefix_window, 1)
+            return max(int(total_tokens_est * self.hit_discount), 1)
         return total_tokens_est
 
 
@@ -131,9 +134,14 @@ class LMetricRouter:
         self,
         instance_urls: list[str],
         prefix_window: int = 256,
+        hit_discount: float = 0.5,
+        max_load_ratio: float = 2.0,
     ):
         self.instances = [InstanceState(url=u) for u in instance_urls]
-        self.affinity = PrefixAffinityTracker(prefix_window=prefix_window)
+        self.affinity = PrefixAffinityTracker(
+            prefix_window=prefix_window, hit_discount=hit_discount
+        )
+        self.max_load_ratio = max_load_ratio
         self._session: aiohttp.ClientSession | None = None
         self._round_robin_idx = 0
 
@@ -167,16 +175,23 @@ class LMetricRouter:
         return max(len(text) // 4, 1)
 
     def select_instance(self, body: dict) -> int:
-        """Select the instance with the lowest LMetric score."""
+        """Select the instance with the lowest LMetric score.
+
+        Enforces a load-balance cap: if routing to the LMetric-preferred
+        instance would make its inflight exceed max_load_ratio × the least
+        loaded instance, fall back to the least loaded one instead.
+        """
         prompt = self._extract_prompt(body)
         total_tokens = self._estimate_tokens(prompt)
 
-        best_idx = 0
-        best_score = float("inf")
+        healthy = [(i, inst) for i, inst in enumerate(self.instances) if inst.healthy]
+        if not healthy:
+            return 0
 
-        for i, inst in enumerate(self.instances):
-            if not inst.healthy:
-                continue
+        # Find LMetric-preferred instance
+        best_idx = healthy[0][0]
+        best_score = float("inf")
+        for i, inst in healthy:
             new_prefill = self.affinity.estimate_new_prefill(
                 prompt, i, total_tokens
             )
@@ -184,6 +199,15 @@ class LMetricRouter:
             if score < best_score:
                 best_score = score
                 best_idx = i
+
+        # Load-balance cap: don't let any instance get too far ahead
+        min_inflight = min(inst.inflight for _, inst in healthy)
+        best_inflight = self.instances[best_idx].inflight
+        if min_inflight > 0 and best_inflight > self.max_load_ratio * min_inflight:
+            # Override: pick the least loaded instance
+            best_idx = min(healthy, key=lambda x: x[1].inflight)[0]
+        elif min_inflight == 0 and best_inflight > self.max_load_ratio:
+            best_idx = min(healthy, key=lambda x: x[1].inflight)[0]
 
         self.affinity.record(prompt, best_idx)
         return best_idx
@@ -235,6 +259,9 @@ def create_app(router: LMetricRouter, mode: str = "lmetric") -> FastAPI:
     @app.on_event("startup")
     async def startup():
         await router.check_health()
+        healthy = [i.url for i in router.instances if i.healthy]
+        logger.info("Initial health check: %d/%d healthy: %s",
+                     len(healthy), len(router.instances), healthy)
 
         async def _health_loop():
             while True:
@@ -380,10 +407,14 @@ def run(
     port: int = 9000,
     mode: str = "lmetric",
     prefix_window: int = 256,
+    hit_discount: float = 0.5,
+    max_load_ratio: float = 2.0,
 ):
     router = LMetricRouter(
         instance_urls=instance_urls,
         prefix_window=prefix_window,
+        hit_discount=hit_discount,
+        max_load_ratio=max_load_ratio,
     )
     app = create_app(router, mode=mode)
     logger.info(
