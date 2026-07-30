@@ -78,6 +78,12 @@ class ProcessGroupManager:
         self._process_groups[backend][group] = process_group
 
     def get_process_group(self, backend: str, group: Group):
+        # On Ascend NPU, "nccl" is an alias for "hccl" so that code written
+        # for CUDA (which hardcodes "nccl") works transparently on NPU.
+        import torch
+        if backend == "nccl" and hasattr(torch, "npu") and torch.npu.is_available():
+            if "nccl" not in self._process_groups and "hccl" in self._process_groups:
+                backend = "hccl"
         return self._process_groups[backend][group]
 
     def has_process_group(self, backend: str, group: Group) -> bool:

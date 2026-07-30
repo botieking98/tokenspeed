@@ -55,10 +55,15 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _is_capture_mode = False
+_is_in_graph_capture_process = False
 
 
 def get_is_capture_mode() -> bool:
     return _is_capture_mode
+
+
+def get_is_in_graph_capture_process() -> bool:
+    return _is_in_graph_capture_process
 
 
 def _draft_decode_forward_mode(use_draft_extend: bool) -> ForwardMode:
@@ -289,7 +294,7 @@ class CudaGraphWrapper:
                 draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
                 draft_attn_backend._block_table_aliased = True
 
-        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.graphs: dict[int, Any] = {}
         self.output_buffers: dict[int, tuple] = {}
 
         self._forward_func: Callable | None = forward_func
@@ -311,7 +316,9 @@ class CudaGraphWrapper:
         """
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
-            self.stream = torch.cuda.Stream()
+            _dm = torch.get_device_module(self.device)
+            self.stream = _dm.Stream()
+            self._dm = _dm
             capture_range = tqdm.tqdm(self.capture_bs) if rank == 0 else self.capture_bs
             if rank == 0:
                 logger.info("Capturing batches: %s", self.capture_bs)
@@ -328,7 +335,10 @@ class CudaGraphWrapper:
                 self.output_buffers[bs] = output_buffers
 
     def _capture_one(self, bs: int):
-        graph = torch.cuda.CUDAGraph()
+        if self.device == "npu":
+            graph = torch.npu.NPUGraph()
+        else:
+            graph = torch.cuda.CUDAGraph()
 
         capture_forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -410,7 +420,7 @@ class CudaGraphWrapper:
 
         # Warm up before capture.
         for _ in range(4):
-            torch.cuda.synchronize()
+            self._dm.synchronize()
             dist.barrier()
             if self.sampling_backend is not None:
                 self.sampling_backend.prepare_capture(
@@ -427,7 +437,7 @@ class CudaGraphWrapper:
         if self.sampling_backend is not None:
             self.sampling_backend.reset_capture_state()
 
-        torch.cuda.synchronize()
+        self._dm.synchronize()
         dist.barrier()
 
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
@@ -444,12 +454,28 @@ class CudaGraphWrapper:
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
-            out = run_once()
+        if self.device == "npu":
+            self._dm.current_stream().synchronize()
+            with self._dm.stream(self.stream):
+                graph.capture_begin()
+                out = run_once()
+                graph.capture_end()
+        else:
+            with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
+                out = run_once()
 
-        torch.cuda.synchronize()
+        self._dm.synchronize()
         dist.barrier()
         _is_capture_mode = False
+
+        # NPU: synchronize after capture to flush the capture stream and ensure
+        # the HCCL communicator is ready for eager ops on the default stream.
+        # Unlike NCCL, HCCL communicators on NPU are not permanently stream-bound;
+        # a sync is sufficient to release the capture stream's hold.
+        if self.device == "npu":
+            self._dm.synchronize()
+            dist.barrier()
+            logger.info("Graph capture complete, HCCL communicator ready for eager ops")
 
         # Graph capture records the hostfunc launches without invoking
         # them, so the dummy run_once pushed stays queued — drain it, and
@@ -833,6 +859,11 @@ class CudaGraphWrapper:
         eager forward_func otherwise.  The caller does not need to know which
         path was taken.
         """
+        # NPU: ensure previous graph replay on capture stream completed before
+        # starting a new forward pass (filling input buffers, etc).
+        if self.device == "npu" and not self.disable and hasattr(self, 'stream'):
+            self.stream.synchronize()
+
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
 
@@ -907,8 +938,31 @@ class CudaGraphWrapper:
             # the per-request generators with the capture-stub generator.
             self.deepep_adapter.replay()
 
-            with nvtx_range("graph_replay", color="red"):
-                self.graphs[padded_bs].replay()
+            # NPU ACL graph: sync default stream first to ensure _init_replay_metadata
+            # updates are complete before graph replay reads them on the capture
+            # stream. Then replay on the capture stream (self.stream) so HCCL ops
+            # use the same stream binding they were captured with.
+            if self.device == "npu":
+                self._dm.current_stream().synchronize()
+                with self._dm.stream(self.stream):
+                    with nvtx_range("graph_replay", color="red"):
+                        self.graphs[padded_bs].replay()
+                    if not hasattr(self, '_replay_done_event'):
+                        self._replay_done_event = self._dm.Event()
+                    self._replay_done_event.record(self.stream)
+            else:
+                with nvtx_range("graph_replay", color="red"):
+                    self.graphs[padded_bs].replay()
+
+            if self.device == "npu" and hasattr(
+                self.attn_backend, "update_graph_params"
+            ):
+                self.attn_backend.update_graph_params(padded_bs, self.stream)
+
+            # NPU: default stream must wait for graph replay to complete before
+            # reading output buffers (which were written on self.stream).
+            if self.device == "npu":
+                self._dm.current_stream().wait_event(self._replay_done_event)
 
             output_tokens, output_lengths, output_logprobs = self.output_buffers[
                 padded_bs

@@ -48,7 +48,7 @@ REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.0"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
-VALID_BACKENDS = {"cuda", "rocm"}
+VALID_BACKENDS = {"cuda", "rocm", "ascend"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
 
 # CUDA kernels source and output directories
@@ -190,9 +190,16 @@ def _selected_backend() -> str:
     if _is_rocm_platform():
         return "rocm"
 
+    # On Ascend NPU, no CUDA/ROCm deps needed
+    try:
+        import torch_npu  # noqa: F401
+        return "ascend"
+    except ImportError:
+        pass
+
     raise RuntimeError(
-        "Unable to detect CUDA or ROCm for tokenspeed_kernel dependencies. "
-        f"Set {BACKEND_ENV}=cuda or {BACKEND_ENV}=rocm."
+        "Unable to detect CUDA, ROCm, or Ascend for tokenspeed_kernel dependencies. "
+        f"Set {BACKEND_ENV}=cuda, {BACKEND_ENV}=rocm, or {BACKEND_ENV}=ascend."
     )
 
 

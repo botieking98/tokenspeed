@@ -23,6 +23,8 @@
 Provides global singleton instances for CommBackend and TritonRSAGBackend.
 """
 
+import torch
+
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
 
 _global_backend: CommBackend | None = None
@@ -34,6 +36,12 @@ def initialize_comm_backend(
 ) -> CommBackend:
     """Create and configure the global communication backend."""
     global _global_backend
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        from tokenspeed.runtime.distributed.comm_backend.hccl import HcclBackend
+
+        _global_backend = HcclBackend()
+        return _global_backend
 
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
 

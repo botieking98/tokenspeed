@@ -1,0 +1,2 @@
+# Ascend NPU third-party requirements (minimal - no CUDA deps)
+torch_npu

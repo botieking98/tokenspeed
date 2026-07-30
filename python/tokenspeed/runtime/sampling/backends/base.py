@@ -139,7 +139,9 @@ class SamplingBackend(ABC):
                 process_group_manager as pg_manager,
             )
 
-            self._tp_pg = pg_manager.get_process_group("nccl", config.tp_group)
+            import torch
+            _backend = "hccl" if (hasattr(torch, "npu") and torch.npu.is_available()) else "nccl"
+            self._tp_pg = pg_manager.get_process_group(_backend, config.tp_group)
             self._tp_src_global_rank = config.tp_group[0]
 
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:

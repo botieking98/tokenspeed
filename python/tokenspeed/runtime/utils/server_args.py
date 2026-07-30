@@ -797,7 +797,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda"],
+            choices=["cuda", "npu"],
             help="The device type.",
         )
         parser.add_argument(
@@ -1262,6 +1262,7 @@ class ServerArgs:
             "flashmla",
             "tokenspeed_mla",
             "hybrid_linear_attn",
+            "npu_mla",
         ]
         parser.add_argument(
             "--attention-backend",

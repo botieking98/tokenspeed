@@ -46,8 +46,43 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _is_amd = current_platform().is_amd
+_is_ascend = current_platform().is_ascend
 
-if _is_amd:
+if _is_ascend:
+    import torch_npu
+
+    def rmsnorm(x, weight, eps, out=None, enable_pdl=False):
+        """RMSNorm using torch_npu.npu_rms_norm."""
+        result, _ = torch_npu.npu_rms_norm(x, weight, epsilon=eps)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+    def fused_add_rmsnorm(x, residual, weight, eps, enable_pdl=False):
+        """Fused add + RMSNorm for NPU.
+
+        Modifies x and residual in-place: residual becomes x+residual,
+        x becomes rmsnorm(x+residual).
+        """
+        residual.add_(x)
+        result, _ = torch_npu.npu_rms_norm(residual, weight, epsilon=eps)
+        x.copy_(result)
+        return x, residual
+
+    def gemma_rmsnorm(x, weight, eps, out=None, enable_pdl=False):
+        return rmsnorm(x, weight, eps, out=out, enable_pdl=enable_pdl)
+
+    def gemma_fused_add_rmsnorm(x, residual, weight, eps, enable_pdl=False):
+        return fused_add_rmsnorm(x, residual, weight, eps, enable_pdl=enable_pdl)
+
+    def rmsnorm_fused_parallel(*args, **kwargs):
+        raise NotImplementedError("rmsnorm_fused_parallel not supported on NPU")
+
+    triton_rmsnorm = None
+    triton_rmsnorm_fused_parallel = None
+
+elif _is_amd:
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import (
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,

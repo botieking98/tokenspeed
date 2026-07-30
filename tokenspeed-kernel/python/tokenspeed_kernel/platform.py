@@ -149,6 +149,10 @@ class PlatformInfo:
         return self.is_nvidia and self.arch_version.major == 8
 
     @property
+    def is_ascend(self) -> bool:
+        return self.vendor == "ascend"
+
+    @property
     def is_amd(self) -> bool:
         return self.vendor == "amd"
 
@@ -206,6 +210,8 @@ class PlatformInfo:
     def register_host_tensor_for_gpu_access(self, tensor: torch.Tensor) -> None:
         """Register host memory that GPU kernels will directly dereference."""
         if tensor.device.type != "cpu" or tensor.numel() == 0:
+            return
+        if self.is_ascend:
             return
         status = torch.cuda.cudart().cudaHostRegister(
             tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0
@@ -339,7 +345,33 @@ def _detect_platform() -> PlatformInfo:
             return _detect_rocm_platform()
         return _detect_cuda_platform()
 
-    raise RuntimeError("tokenspeed-kernel requires an NVIDIA CUDA or AMD ROCm GPU.")
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return _detect_ascend_platform()
+
+    raise RuntimeError("tokenspeed-kernel requires an NVIDIA CUDA, AMD ROCm, or Ascend NPU.")
+
+
+
+def _detect_ascend_platform() -> PlatformInfo:
+    """Detect Ascend NPU platform."""
+    import torch
+    import torch_npu  # noqa: F401
+
+    device_count = torch.npu.device_count()
+    device_name = torch.npu.get_device_name(0)
+    total_memory = torch.npu.get_device_properties(0).total_memory
+
+    return PlatformInfo(
+        vendor="ascend",
+        arch_version=ArchVersion(0, 0),
+        device_name=device_name,
+        device_count=device_count,
+        total_memory=total_memory,
+        memory_bandwidth=0.0,
+        sm_count=0,
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=0,
+    )
 
 
 def _detect_cuda_platform() -> PlatformInfo:

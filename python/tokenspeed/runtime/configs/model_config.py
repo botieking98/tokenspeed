@@ -56,6 +56,7 @@ _MLA_ARCHITECTURES = frozenset(
         "Eagle3DeepseekV2ForCausalLM",
         "LongcatFlashForCausalLM",
         "KimiK25ForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
     }
 )
 _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(

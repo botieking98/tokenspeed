@@ -22,26 +22,64 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
-from tokenspeed_kernel.ops.attention import (
-    attn_merge_state,
-    attn_plan,
-    mha_decode_with_kvcache,
-    mha_extend_with_kvcache,
-    mha_prefill,
-    mla_decode_with_kvcache,
-    mla_prefill,
-)
-from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
-from tokenspeed_kernel.ops.quantization import (
-    quantize_fp8,
-    quantize_fp8_with_scale,
-    quantize_mxfp4,
-    quantize_mxfp8,
-    quantize_nvfp4,
-)
-from tokenspeed_kernel.ops.sampling import argmax
-from tokenspeed_kernel.selection import NoKernelFoundError
+# Kernel ops may require CUDA-specific backends; import resiliently so the
+# package can be loaded on Ascend NPU where only a subset of ops exist.
+try:
+    from tokenspeed_kernel.ops.attention import (
+        attn_merge_state,
+        attn_plan,
+        mha_decode_with_kvcache,
+        mha_extend_with_kvcache,
+        mha_prefill,
+        mla_decode_with_kvcache,
+        mla_prefill,
+    )
+except (ImportError, ModuleNotFoundError):
+    attn_merge_state = None
+    attn_plan = None
+    mha_decode_with_kvcache = None
+    mha_extend_with_kvcache = None
+    mha_prefill = None
+    mla_decode_with_kvcache = None
+    mla_prefill = None
+
+try:
+    from tokenspeed_kernel.ops.gemm import mm
+except (ImportError, ModuleNotFoundError):
+    mm = None
+
+try:
+    from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
+except (ImportError, ModuleNotFoundError):
+    moe_apply = None
+    moe_plan = None
+    moe_process_weights = None
+
+try:
+    from tokenspeed_kernel.ops.quantization import (
+        quantize_fp8,
+        quantize_fp8_with_scale,
+        quantize_mxfp4,
+        quantize_mxfp8,
+        quantize_nvfp4,
+    )
+except (ImportError, ModuleNotFoundError):
+    quantize_fp8 = None
+    quantize_fp8_with_scale = None
+    quantize_mxfp4 = None
+    quantize_mxfp8 = None
+    quantize_nvfp4 = None
+
+try:
+    from tokenspeed_kernel.ops.sampling import argmax
+except (ImportError, ModuleNotFoundError):
+    argmax = None
+
+try:
+    from tokenspeed_kernel.selection import NoKernelFoundError
+except (ImportError, ModuleNotFoundError):
+    class NoKernelFoundError(Exception):
+        pass
 
 __all__ = [
     # exceptions

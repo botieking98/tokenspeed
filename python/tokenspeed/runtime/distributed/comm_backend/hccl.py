@@ -18,21 +18,40 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime device configuration helpers."""
+"""HCCL communication backend for Ascend NPU.
+
+Delegates to torch.distributed with the hccl backend. Process groups are
+looked up from pg_manager using the "hccl" key.
+"""
 
 import torch
+import torch.distributed
 
-from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
+from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 
-logger = get_colorful_logger(__name__)
 
+class HcclBackend(NcclBackend):
+    """Backend using HCCL via torch.distributed.
 
-class DeviceConfig:
-    device: torch.device | None
+    Identical to NcclBackend except process groups are looked up with the
+    "hccl" key and PyNccl is never used.
+    """
 
-    def __init__(self, device: str = "cuda") -> None:
-        if device in ("cuda", "npu"):
-            self.device_type = device
-        else:
-            raise RuntimeError(f"Not supported device type: {device}")
-        self.device = torch.device(self.device_type)
+    def _get_or_create_resources(self, group: Group):
+        if group in self._resources:
+            return self._resources[group]
+
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+
+        device_group = pg_manager.get_process_group("hccl", group)
+        world_size = len(group)
+
+        self._resources[group] = {
+            "pynccl_comm": None,
+            "device_group": device_group,
+            "world_size": world_size,
+        }
+        return self._resources[group]
