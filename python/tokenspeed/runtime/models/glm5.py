@@ -429,9 +429,11 @@ class GlmMoeDsaAttention(nn.Module):
             )
             attn_output[num_prefill_tokens:] = decode_out
 
-        output = self.o_proj(attn_output)
         if self.o_proj.tp_size > 1:
+            output = self.o_proj(attn_output)
             output = all_reduce(output, self.mapping.attn.tp_group)
+        else:
+            output = self.o_proj(attn_output)
         return output
 
     def _forward_prefill(

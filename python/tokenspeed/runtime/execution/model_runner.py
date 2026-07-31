@@ -116,6 +116,27 @@ class ModelRunner:
             self.model, "spec_step_idx"
         )
 
+        # Compile model forward with torch.compile using npu_eager backend.
+        # This gives dynamo tracing (eliminates Python dispatch overhead)
+        # while keeping all ops as CANN native calls (no inductor MTE errors).
+        if self.device == "npu" and not self.server_args.enforce_eager:
+            import torch
+            import torch._dynamo as dynamo
+
+            def _npu_eager_backend(gm, example_inputs):
+                return gm.forward
+
+            dynamo.backends.registry.register_backend(_npu_eager_backend, name="npu_eager")
+
+            logger.info("Compiling model.forward with torch.compile(backend='npu_eager')")
+            self._original_model_forward = self.model.forward
+            self.model.forward = torch.compile(
+                self.model.forward,
+                backend="npu_eager",
+                fullgraph=False,
+                dynamic=False,
+            )
+
     @staticmethod
     def _forward_accepts_kwarg(model, name: str) -> bool:
         try:

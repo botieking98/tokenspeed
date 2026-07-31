@@ -319,6 +319,13 @@ class CudaGraphWrapper:
             _dm = torch.get_device_module(self.device)
             self.stream = _dm.Stream()
             self._dm = _dm
+
+            # Pre-compile phase: trigger torch.compile's lazy tracing on the
+            # DEFAULT stream before entering the capture stream. This lets
+            # dynamo trace the model once so subsequent calls (including
+            # warmup inside _capture_one) use the compiled FX graph.
+            self._pre_compile()
+
             capture_range = tqdm.tqdm(self.capture_bs) if rank == 0 else self.capture_bs
             if rank == 0:
                 logger.info("Capturing batches: %s", self.capture_bs)
@@ -333,6 +340,87 @@ class CudaGraphWrapper:
                 graph, output_buffers = self._capture_one(bs)
                 self.graphs[bs] = graph
                 self.output_buffers[bs] = output_buffers
+
+    def _pre_compile(self):
+        """Pre-compile: trigger torch.compile tracing on default stream.
+
+        Runs one forward pass with the smallest batch size on the default
+        stream to let dynamo trace the model. Must happen BEFORE entering
+        the capture stream.
+        """
+        if not self.capture_bs:
+            return
+        bs = self.capture_bs[0]
+        rank = self.global_rank
+        if rank == 0:
+            logger.info("Pre-compile phase: triggering torch.compile trace (bs=%d)", bs)
+
+        capture_forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if self.drafter is not None and self.use_target_verify_forward_mode
+            else ForwardMode.DECODE
+        )
+        ctx = ForwardContext(
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            bs=bs,
+            num_extends=0,
+            input_num_tokens=bs * self.max_tokens_per_req,
+            forward_mode=capture_forward_mode,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self.drafter is not None
+                else CaptureHiddenMode.NULL
+            ),
+        )
+        if self.dp_size > 1:
+            ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
+            ctx.global_bs = [bs] * self.world_size
+
+        ibd = self.input_buffers
+        sampling_info = SamplingBatchInfo(
+            req_pool_indices=ibd.req_pool_indices_buf[:bs],
+            valid_cache_lengths=(
+                self.runtime_states.valid_cache_lengths
+                if self.runtime_states is not None
+                else None
+            ),
+            is_all_greedy=False,
+            vocab_size=self.vocab_size,
+            device=self.device,
+        )
+
+        from tokenspeed.runtime.grammar.capturable_grammar import (
+            bind_grammar_mask_buf,
+        )
+        bind_grammar_mask_buf(
+            sampling_info,
+            self.eager_grammar_buffers,
+            bs,
+            spec=self.drafter is not None,
+            capturable=self.capturable_grammar,
+            grammar_backend=self.grammar_backend,
+        )
+
+        self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+        self._init_capture_metadata(bs)
+        if self.sampling_backend is not None:
+            self.sampling_backend.prepare_capture(
+                bs=bs, num_tokens_per_req=self.max_tokens_per_req
+            )
+        if self.capturable_grammar is not None:
+            self.capturable_grammar.add_batch(
+                grammars=[None] * bs, bs=bs, has_candidates=False
+            )
+        self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+        self._dm.synchronize()
+        dist.barrier()
+
+        if self.sampling_backend is not None:
+            self.sampling_backend.reset_capture_state()
+
+        if rank == 0:
+            logger.info("Pre-compile phase complete")
 
     def _capture_one(self, bs: int):
         if self.device == "npu":

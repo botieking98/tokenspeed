@@ -65,9 +65,7 @@ if _is_ascend:
         Modifies x and residual in-place: residual becomes x+residual,
         x becomes rmsnorm(x+residual).
         """
-        residual.add_(x)
-        result, _ = torch_npu.npu_rms_norm(residual, weight, epsilon=eps)
-        x.copy_(result)
+        torch_npu.npu_add_rms_norm_v2(x, residual, weight, eps)
         return x, residual
 
     def gemma_rmsnorm(x, weight, eps, out=None, enable_pdl=False):
