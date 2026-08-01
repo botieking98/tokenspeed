@@ -630,13 +630,17 @@ class GlmMoeDsaMoE(nn.Module):
             process_group_manager as pg_manager,
         )
         try:
-            group = self.mapping.moe.tp_ep_group
+            # Try attn.tp_group first (known to work with HCCL all_reduce).
+            # Both tp_group and tp_ep_group contain all 16 ranks with TP=1,EP=16.
+            group = self.mapping.attn.tp_group
             device_group = pg_manager.get_process_group("hccl", group)
             local_rank = dist.get_rank(group=device_group)
             backend = device_group._get_backend(torch.device("npu"))
             self._mc2_group_name = backend.get_hccl_comm_name(local_rank)
-            self._ep_world_size = self.mapping.moe.tp_ep_size
-            self._ep_rank_id = self.mapping.moe.tp_ep_rank
+            self._ep_world_size = self.mapping.attn.tp_size
+            self._ep_rank_id = self.mapping.attn.tp_rank
+            logger.info("MC2 init using attn.tp_group: group=%s ep_world_size=%d ep_rank_id=%d",
+                       self._mc2_group_name, self._ep_world_size, self._ep_rank_id)
         except Exception as e:
             logger.warning("MC2 init failed: %s, using all_reduce", e)
             self._mc2_group_name = None
@@ -752,7 +756,13 @@ class GlmMoeDsaMoE(nn.Module):
         router_logits = self.gate(hidden_states)
         topk_weights, topk_ids = self._select_experts(hidden_states, router_logits)
 
-        output = self._forward_grouped_matmul(hidden_states, topk_weights, topk_ids, ctx)
+        # Decode uses MC2 dispatch/combine (eliminates 75 all_reduce/step).
+        # Prefill/extend falls back to grouped_matmul + all_reduce (safe, no
+        # MC2 capacity constraint for large token counts).
+        if ctx.forward_mode.is_decode() and self._mc2_available():
+            output = self._forward_mc2(hidden_states, topk_weights, topk_ids, ctx)
+        else:
+            output = self._forward_grouped_matmul(hidden_states, topk_weights, topk_ids, ctx)
 
         if self.shared_experts is not None:
             output = output + self.shared_experts(hidden_states)
@@ -780,33 +790,48 @@ class GlmMoeDsaMoE(nn.Module):
 
         self._prepare_grouped_weights()
 
-        # Pre-allocate mc2_mask (all tokens active at fixed bs for graph)
+        # No padding: pass N tokens directly. Mask = ones(N), global_bs=0.
         if not hasattr(self, "_mc2_mask") or self._mc2_mask.shape[0] != N:
             self._mc2_mask = torch.ones(N, dtype=torch.bool, device=hidden_states.device)
 
-        # MC2 dispatch: send tokens to ranks with needed experts
+        # MC2 dispatch: send tokens to ranks with needed experts.
         dispatch_out = torch_npu.npu_moe_distribute_dispatch_v2(
-            x=hidden_states,
-            expert_ids=topk_ids.to(torch.int32),
-            expert_shard_type=0,
-            shared_expert_rank_num=0,
-            moe_expert_num=self.num_experts,
-            global_bs=0,
-            expert_token_nums_type=0,  # cumsum mode
-            x_active_mask=self._mc2_mask,
-            scales=None,
-            quant_mode=0,
-            group_ep=self._mc2_group_name,
-            ep_world_size=self._ep_world_size,
-            ep_rank_id=self._ep_rank_id,
-        )
+                x=hidden_states,
+                expert_ids=topk_ids.to(torch.int32),
+                expert_shard_type=0,
+                shared_expert_rank_num=0,
+                moe_expert_num=self.num_experts,
+                global_bs=0,
+                expert_token_nums_type=0,
+                x_active_mask=self._mc2_mask,
+                scales=None,
+                quant_mode=0,
+                group_ep=self._mc2_group_name,
+                ep_world_size=self._ep_world_size,
+                ep_rank_id=self._ep_rank_id,
+                group_tp=self._mc2_group_name,
+                tp_world_size=1,
+                tp_rank_id=0,
+            )
         expand_x = dispatch_out[0]
         assist_info_for_combine = dispatch_out[2]
         expert_token_nums = dispatch_out[3]
         ep_recv_counts = dispatch_out[4]
         expand_scales = dispatch_out[6]
 
+        # The antiquant gmm requires group_list of length == num_local_experts
+        # (to match the per-expert antiquant_scale batch). MC2 dispatch may
+        # return a shorter tensor when fewer experts are active on this rank.
+        # Pad cumsum with the last value (remaining experts have 0 tokens).
         group_list = expert_token_nums.to(torch.int64)
+        if group_list.numel() < self.num_local_experts:
+            pad_len = self.num_local_experts - group_list.numel()
+            if group_list.numel() > 0:
+                group_list = torch.cat([
+                    group_list, group_list[-1:].repeat(pad_len)])
+            else:
+                group_list = torch.zeros(self.num_local_experts,
+                    dtype=torch.int64, device=hidden_states.device)
 
         # gmm1: fused gate_up_proj (antiquant: BF16 x INT8 ND)
         gate_up_out = torch_npu.npu_grouped_matmul(
@@ -837,7 +862,8 @@ class GlmMoeDsaMoE(nn.Module):
             output_dtype=hidden_states.dtype,
         )[0]
 
-        # MC2 combine: send results back and combine with topk_weights
+        # MC2 combine: send results back and combine with topk_weights.
+        # A3 requires tp_send_counts/group_tp/tp_world_size/tp_rank_id.
         output = torch_npu.npu_moe_distribute_combine_v2(
             expand_x=down_out,
             expert_ids=topk_ids.to(torch.int32),
@@ -854,6 +880,10 @@ class GlmMoeDsaMoE(nn.Module):
             expand_scales=expand_scales,
             comm_quant_mode=0,
             assist_info_for_combine=assist_info_for_combine,
+            tp_send_counts=ep_recv_counts,
+            group_tp=self._mc2_group_name,
+            tp_world_size=1,
+            tp_rank_id=0,
         )
 
         return output
@@ -992,7 +1022,7 @@ class GlmMoeDsaMoE(nn.Module):
         if self.ep_size > 1:
             output = backend.reduce_scatter(output, group)
 
-        return output[:N] if self.ep_size <= 1 else output
+        return output if self.ep_size <= 1 else output
 
 
     def _forward_prefill_allreduce(self, hidden_states, topk_weights, topk_ids, ctx):
