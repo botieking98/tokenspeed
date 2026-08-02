@@ -192,15 +192,12 @@ class W8A8StaticLinear(nn.Module):
         self.weight.data = self.weight.data.transpose(0, 1).contiguous()
         self.weight.data = _maybe_trans_nz(self.weight.data)
         self.deq_scale.data = self.deq_scale.data.to(torch.float32).contiguous()
-        # Precompute reciprocal for faster quantization (mul vs div)
-        self._scale_recip = (1.0 / self.input_scale.data).to(torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Fused quantization: mul + round + clamp + cast (4 ops vs 6)
-        quant_x = torch.clamp(
-            torch.round(x * self._scale_recip + self.input_offset.data),
-            -128, 127,
-        ).to(torch.int8)
+        quant_x = torch_npu.npu_quantize(
+            x, self.input_scale.data, self.input_offset.data.to(torch.int8),
+            torch.qint8, axis=1, div_mode=True,
+        )
         bias = self.quant_bias
         if getattr(self, "is_row_parallel", False) and getattr(self, "tp_rank", 0) != 0:
             bias = None
@@ -497,12 +494,11 @@ class GlmMoeDsaAttention(nn.Module):
 
         # Fused Q + KV projection (one quantize + one matmul)
         self._maybe_fuse_qkv_a()
-        scale = self._qkv_a_input_scale
-        offset = self._qkv_a_input_offset.to(torch.int8)
-        quant_x = torch.clamp(
-            torch.round(hidden_states / scale).to(torch.int32) + offset,
-            -128, 127,
-        ).to(torch.int8)
+        quant_x = torch_npu.npu_quantize(
+            hidden_states, self._qkv_a_input_scale,
+            self._qkv_a_input_offset.to(torch.int8),
+            torch.qint8, axis=1, div_mode=True,
+        )
         qkv_a = torch_npu.npu_quant_matmul(
             quant_x, self._qkv_a_weight, self._qkv_a_deq_scale,
             bias=self._qkv_a_quant_bias, output_dtype=hidden_states.dtype,
