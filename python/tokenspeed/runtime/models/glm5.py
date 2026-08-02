@@ -952,6 +952,39 @@ class GlmMoeDsaMoE(nn.Module):
 
         return output
 
+    def _forward_fused_mc2(self, hidden_states, topk_weights, topk_ids, ctx):
+        """Fully fused MC2: dispatch+gmm+swiglu+gmm+combine in ONE kernel.
+
+        Uses _C_ascend.dispatch_gmm_combine_decode which eliminates:
+        - init_routing, dynamic_quant, gmm1, swiglu, gmm2, unpermute, all_reduce
+        All replaced by a single fused C++ kernel with integrated HCCL communication.
+        This is vllm-ascend's enable_fused_mc2=2 path.
+        """
+        N = hidden_states.shape[0]
+        self._prepare_grouped_weights()
+        self._init_mc2()
+
+        if not hasattr(self, "_mc2_mask") or self._mc2_mask.shape[0] != N:
+            self._mc2_mask = torch.ones(N, dtype=torch.bool, device=hidden_states.device)
+
+        output, expert_tokens = torch.ops._C_ascend.dispatch_gmm_combine_decode(
+            x=hidden_states,
+            expert_ids=topk_ids.to(torch.int32),
+            gmm1_permuted_weight=[self._grouped_w13_weight],
+            gmm1_permuted_weight_scale=[self._quant_w13_scale],
+            gmm2_weight=[self._grouped_w2_weight],
+            gmm2_weight_scale=[self._quant_w2_scale],
+            expert_scales=topk_weights.to(torch.float32),
+            expert_smooth_scales=None,
+            group_ep=self._mc2_group_name,
+            ep_rank_size=self._ep_world_size,
+            ep_rank_id=self._ep_rank_id,
+            moe_expert_num=self.num_experts,
+            global_bs=0,
+        )
+
+        return output
+
     def _forward_quant_gmm(self, hidden_states, topk_weights, topk_ids, ctx):
         """Quantized MoE: INT8×INT8 via _C_ascend custom ops.
 
