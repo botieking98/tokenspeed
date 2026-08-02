@@ -1031,8 +1031,9 @@ class GlmMoeDsaMoE(nn.Module):
         local_mask = (topk_ids >= first_expert) & (topk_ids < first_expert + E)
         topk_weights_masked = topk_weights * local_mask.to(topk_weights.dtype)
 
-        # Token dispatch: sort tokens by local expert (bf16 -> bf16 expanded)
-        expanded_x, expanded_row_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
+        # Token dispatch with fused dynamic quant (quant_mode=1):
+        # bf16 → int8 expanded_x + per-token scale in one kernel
+        expanded_x, expanded_row_idx, expert_tokens, expanded_scale = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             topk_ids.to(torch.int32),
             active_num=N * K,
@@ -1040,16 +1041,14 @@ class GlmMoeDsaMoE(nn.Module):
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
             active_expert_range=[first_expert, first_expert + E],
-            quant_mode=-1,
+            quant_mode=1,
         )
         group_list = expert_tokens.to(torch.int64)
         group_list_cumsum = group_list.cumsum(0)
 
-        # Quantize expanded activations: bf16 -> int8 + per-token scale
-        quant_x, pertoken_scale = torch_npu.npu_dynamic_quant(expanded_x, dst_type=torch.int8)
-        if pertoken_scale.dim() == 2:
-            quant_x = quant_x.squeeze(1)
-            pertoken_scale = pertoken_scale.squeeze(1)
+        # expanded_x is already int8, expanded_scale is per-token scale
+        quant_x = expanded_x
+        pertoken_scale = expanded_scale
 
         # gmm1: fused gate_up + swiglu + quant (INT8*INT8->INT8 + scale)
         gate_up_out, swiglu_out_scale, _ = torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz(
