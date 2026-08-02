@@ -379,6 +379,7 @@ class GlmMoeDsaAttention(nn.Module):
         self.o_proj.is_row_parallel = True
         self._tp_group_name = None
         self._o_proj_dequant_done = False
+        self._qkv_a_fused = False
 
         # RoPE (interleaved) - use NPU native implementation
         rope_max_pos = min(max_position_embeddings, 40960)
@@ -408,6 +409,32 @@ class GlmMoeDsaAttention(nn.Module):
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
         )
+
+    def _maybe_fuse_qkv_a(self):
+        """Fuse q_a_proj + kv_a_proj_with_mqa into a single matmul.
+
+        Both share the same input_scale/input_offset (verified from checkpoint),
+        so one quantization + one matmul replaces two separate projections.
+        """
+        if self._qkv_a_fused:
+            return
+        with torch.no_grad():
+            self._qkv_a_weight = torch.cat([
+                self.q_a_proj.weight.data,
+                self.kv_a_proj_with_mqa.weight.data,
+            ], dim=1).contiguous()
+            self._qkv_a_deq_scale = torch.cat([
+                self.q_a_proj.deq_scale.data,
+                self.kv_a_proj_with_mqa.deq_scale.data,
+            ]).contiguous()
+            self._qkv_a_quant_bias = torch.cat([
+                self.q_a_proj.quant_bias.data,
+                self.kv_a_proj_with_mqa.quant_bias.data,
+            ]).contiguous()
+            self._qkv_a_input_scale = self.q_a_proj.input_scale.data
+            self._qkv_a_input_offset = self.q_a_proj.input_offset.data
+            self._q_lora_rank = self.q_a_proj.out_features
+        self._qkv_a_fused = True
 
     def _dequant_o_proj(self):
         """Dequantize o_proj weight to bf16 for matmul_allreduce_add_rmsnorm fusion.
@@ -467,14 +494,24 @@ class GlmMoeDsaAttention(nn.Module):
         num_decode_tokens = num_decodes * ctx.attn_backend.spec_num_tokens
         num_prefill_tokens = num_tokens - num_decode_tokens
 
-        # Q projection
-        q_a = self.q_a_proj(hidden_states)
+        # Fused Q + KV projection (one quantize + one matmul)
+        self._maybe_fuse_qkv_a()
+        scale = self._qkv_a_input_scale
+        offset = self._qkv_a_input_offset.to(torch.int8)
+        quant_x = torch.clamp(
+            torch.round(hidden_states / scale).to(torch.int32) + offset,
+            -128, 127,
+        ).to(torch.int8)
+        qkv_a = torch_npu.npu_quant_matmul(
+            quant_x, self._qkv_a_weight, self._qkv_a_deq_scale,
+            bias=self._qkv_a_quant_bias, output_dtype=hidden_states.dtype,
+        )
+        q_a = qkv_a[..., :self._q_lora_rank]
+        latent_cache = qkv_a[..., self._q_lora_rank:]
+
         q_norm = self.q_a_layernorm(q_a)
         q = self.q_b_proj(q_norm)
         q = q.view(num_tokens, self.num_local_heads, self.qk_head_dim)
-
-        # KV projection (compressed)
-        latent_cache = self.kv_a_proj_with_mqa(hidden_states)  # [N, kv_lora+rope]
 
         attn_output = torch.empty(
             num_tokens, self.num_local_heads * self.v_head_dim,
