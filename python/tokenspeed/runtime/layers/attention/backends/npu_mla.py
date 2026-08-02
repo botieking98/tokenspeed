@@ -283,16 +283,19 @@ class NPUMlaAttnBackend(AttentionBackend):
         k_nope = kv_cache[..., : self.kv_lora_rank].contiguous()
         k_pe = kv_cache[..., self.kv_lora_rank :].contiguous()
 
-        # V decompression weight from kv_b_proj
+        # V decompression weight from kv_b_proj (cached to avoid per-step .contiguous())
         kv_b_proj = getattr(layer, "kv_b_proj", None)
         if kv_b_proj is None:
             raise RuntimeError("layer.kv_b_proj not found for NPU MLA decode")
-        w_kv = kv_b_proj.weight.view(
-            self.num_local_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        w_uv = w_kv[:, self.qk_nope_head_dim :, :].transpose(1, 2).contiguous()
+        w_uv = getattr(layer, "_cached_w_uv", None)
+        if w_uv is None:
+            w_kv = kv_b_proj.weight.view(
+                self.num_local_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+                self.kv_lora_rank,
+            )
+            w_uv = w_kv[:, self.qk_nope_head_dim :, :].transpose(1, 2).contiguous()
+            layer._cached_w_uv = w_uv
 
         # Paged attention via npu_fused_infer_attention_score_v2
         # Pre-allocate workspace and output as instance attributes so they
