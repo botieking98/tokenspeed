@@ -439,6 +439,34 @@ class GlmMoeDsaAttention(nn.Module):
             self._qkv_a_quant_offset_i32 = self._qkv_a_input_offset.to(torch.int32).expand(hidden_size).contiguous()
         self._qkv_a_fused = True
 
+    def _prepare_norm_quant_fusion(self):
+        """Precompute params for RMSNorm+Quant fusion (npu_rms_norm_quant).
+
+        Fuses q_a_layernorm + q_b_proj.quant into a single kernel.
+        """
+        if getattr(self, '_norm_quant_fused', False):
+            return
+        self._q_b_scale_bf16 = self.q_b_proj.input_scale.data.to(torch.bfloat16).contiguous()
+        self._q_b_offset_i8 = self.q_b_proj.input_offset.data.to(torch.int8).contiguous()
+        self._q_b_beta = torch.zeros_like(self.q_a_layernorm.weight.data)
+        self._norm_quant_fused = True
+
+    def _fused_q_b_proj(self, q_a):
+        """Fused q_a_layernorm + q_b_proj quant + matmul."""
+        self._prepare_norm_quant_fusion()
+        quant_q = torch_npu.npu_rms_norm_quant(
+            q_a, self.q_a_layernorm.weight.data, self._q_b_beta,
+            self._q_b_scale_bf16, self._q_b_offset_i8,
+            epsilon=self.q_a_layernorm.variance_epsilon,
+        )
+        bias = self.q_b_proj.quant_bias
+        if getattr(self.q_b_proj, "is_row_parallel", False) and getattr(self.q_b_proj, "tp_rank", 0) != 0:
+            bias = None
+        return torch_npu.npu_quant_matmul(
+            quant_q, self.q_b_proj.weight, self.q_b_proj.deq_scale,
+            bias=bias, output_dtype=torch.bfloat16,
+        )
+
     def _dequant_o_proj(self):
         """Dequantize o_proj weight to bf16 for matmul_allreduce_add_rmsnorm fusion.
 
@@ -516,8 +544,7 @@ class GlmMoeDsaAttention(nn.Module):
         q_a = qkv_a[..., :self._q_lora_rank]
         latent_cache = qkv_a[..., self._q_lora_rank:]
 
-        q_norm = self.q_a_layernorm(q_a)
-        q = self.q_b_proj(q_norm)
+        q = self._fused_q_b_proj(q_a)
         q = q.view(num_tokens, self.num_local_heads, self.qk_head_dim)
 
         attn_output = torch.empty(
