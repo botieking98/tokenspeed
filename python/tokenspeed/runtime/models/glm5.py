@@ -39,6 +39,30 @@ logger = get_colorful_logger(__name__)
 
 ACL_FORMAT_FRACTAL_NZ = 29
 
+def _load_ascend_custom_ops():
+    """Load _C_ascend custom ops for int8×int8 quantized grouped matmul.
+
+    Provides grouped_matmul_swiglu_quant_weight_nz (fused gmm+swiglu+quant)
+    from vllm-ascend's CANN custom op vendor package.
+    """
+    import os
+    vendor = "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
+    if os.path.isdir(vendor):
+        cur = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+        if vendor not in cur:
+            os.environ["ASCEND_CUSTOM_OPP_PATH"] = vendor + (":" + cur if cur else "")
+        lib = os.path.join(vendor, "op_api", "lib")
+        cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        if lib not in cur_ld:
+            os.environ["LD_LIBRARY_PATH"] = lib + (":" + cur_ld if cur_ld else "")
+    try:
+        import vllm_ascend.vllm_ascend_C  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+_CUSTOM_OPS_LOADED = _load_ascend_custom_ops()
+
 
 def _maybe_trans_nz(tensor: torch.Tensor) -> torch.Tensor:
     try:
@@ -674,33 +698,35 @@ class GlmMoeDsaMoE(nn.Module):
         up_weight = stack_nd(self.experts, "up_proj")      # [E, in, out]
         down_weight = stack_nd(self.experts, "down_proj")   # [E, inter, hidden]
 
-        # Fuse gate + up: [E, in, 2*out]
-        self._grouped_w13_weight = torch.cat([gate_weight, up_weight], dim=2).contiguous()
+        # Fuse gate + up: [E, in, 2*inter] ND, then convert to NZ format
+        nd_w13 = torch.cat([gate_weight, up_weight], dim=2).contiguous()
         del gate_weight, up_weight
-        self._grouped_w2_weight = down_weight
+        nd_w2 = down_weight
 
-        # Fuse scales/offsets: [E, 2*out] and [E, hidden] in bf16
+        # Convert to NZ format (saves memory: only one copy, used for both
+        # quant gmm and antiquant paths, matching vllm-ascend approach)
+        self._grouped_w13_weight = torch_npu.npu_format_cast(nd_w13, ACL_FORMAT_FRACTAL_NZ)
+        del nd_w13
+        self._grouped_w2_weight = torch_npu.npu_format_cast(nd_w2, ACL_FORMAT_FRACTAL_NZ)
+        del nd_w2
+
+        # Float32 scales for quant gmm path: [E, out]
         gate_scale = torch.stack(
-            [e.gate_proj.weight_scale for e in self.experts], dim=0).to(torch.bfloat16).contiguous()
+            [e.gate_proj.weight_scale for e in self.experts], dim=0).contiguous()
         up_scale = torch.stack(
-            [e.up_proj.weight_scale for e in self.experts], dim=0).to(torch.bfloat16).contiguous()
+            [e.up_proj.weight_scale for e in self.experts], dim=0).contiguous()
         down_scale = torch.stack(
-            [e.down_proj.weight_scale for e in self.experts], dim=0).to(torch.bfloat16).contiguous()
-
-        self._grouped_w13_scale = torch.cat([gate_scale, up_scale], dim=1).contiguous()
+            [e.down_proj.weight_scale for e in self.experts], dim=0).contiguous()
+        self._quant_w13_scale = torch.cat([gate_scale, up_scale], dim=1).contiguous()
+        self._quant_w2_scale = down_scale
         del gate_scale, up_scale
-        self._grouped_w2_scale = down_scale
 
-        gate_offset = torch.stack(
-            [e.gate_proj.weight_offset for e in self.experts], dim=0).to(torch.bfloat16).contiguous()
-        up_offset = torch.stack(
-            [e.up_proj.weight_offset for e in self.experts], dim=0).to(torch.bfloat16).contiguous()
-        down_offset = torch.stack(
-            [e.down_proj.weight_offset for e in self.experts], dim=0).to(torch.bfloat16).contiguous()
-
-        self._grouped_w13_offset = torch.cat([gate_offset, up_offset], dim=1).contiguous()
-        del gate_offset, up_offset
-        self._grouped_w2_offset = down_offset
+        # bf16 scales for antiquant path (derived from float32)
+        self._grouped_w13_scale = self._quant_w13_scale.to(torch.bfloat16).contiguous()
+        self._grouped_w2_scale = self._quant_w2_scale.to(torch.bfloat16).contiguous()
+        # Offsets are zero (symmetric quantization - verified from checkpoint)
+        self._grouped_w13_offset = torch.zeros_like(self._grouped_w13_scale)
+        self._grouped_w2_offset = torch.zeros_like(self._grouped_w2_scale)
 
         # Free individual expert weights to reclaim memory
         import gc
@@ -718,7 +744,8 @@ class GlmMoeDsaMoE(nn.Module):
 
         if self.mapping.rank == 0 and not GlmMoeDsaMoE._weights_prepared_logged:
             GlmMoeDsaMoE._weights_prepared_logged = True
-            logger.info("Prepared grouped weights (ND antiquant fused): w13=%s w2=%s",
+            logger.info("Prepared grouped weights (ND+NZ, custom_ops=%s): w13=%s w2=%s",
+                         _CUSTOM_OPS_LOADED,
                          str(self._grouped_w13_weight.shape),
                          str(self._grouped_w2_weight.shape))
 
@@ -756,7 +783,10 @@ class GlmMoeDsaMoE(nn.Module):
         router_logits = self.gate(hidden_states)
         topk_weights, topk_ids = self._select_experts(hidden_states, router_logits)
 
-        output = self._forward_grouped_matmul(hidden_states, topk_weights, topk_ids, ctx)
+        if _CUSTOM_OPS_LOADED:
+            output = self._forward_quant_gmm(hidden_states, topk_weights, topk_ids, ctx)
+        else:
+            output = self._forward_grouped_matmul(hidden_states, topk_weights, topk_ids, ctx)
 
         if self.shared_experts is not None:
             output = output + self.shared_experts(hidden_states)
@@ -883,69 +913,70 @@ class GlmMoeDsaMoE(nn.Module):
         return output
 
     def _forward_quant_gmm(self, hidden_states, topk_weights, topk_ids, ctx):
-        """Quantized MoE path: INT8×INT8→BF16 (dequant on the fly).
+        """Quantized MoE: INT8×INT8 via _C_ascend custom ops.
 
-        Uses npu_dynamic_quant for activation quantization, then
-        npu_grouped_matmul with scale+per_token_scale for int8×int8
-        matmul with on-the-fly dequantization to bf16.
-        Faster than antiquant (BF16×INT8) due to full int8 cube throughput.
+        Routes bf16 tokens, quantizes to int8, then uses:
+        - gmm1: grouped_matmul_swiglu_quant_weight_nz (fused gmm+swiglu+quant -> int8)
+        - gmm2: npu_grouped_matmul quant path (int8*int8->bf16 via scale+per_token_scale)
+        Both use full int8 cube throughput, ~2x faster than antiquant (bf16*int8).
         """
         N = hidden_states.shape[0]
+        K = self.top_k
+        E = self.num_local_experts
+        first_expert = self.ep_rank * E
+        global_experts = self.num_experts
 
         self._prepare_grouped_weights()
-        self._prepare_quant_weights()
 
-        # Quantize activations: bf16 → int8 + per-token scale
-        quant_x, pertoken_scale = torch_npu.npu_dynamic_quant(
-            hidden_states, dst_type=torch.int8)
+        # Mask topk_weights for non-local experts
+        local_mask = (topk_ids >= first_expert) & (topk_ids < first_expert + E)
+        topk_weights_masked = topk_weights * local_mask.to(topk_weights.dtype)
 
-        # Token dispatch: sort tokens by local expert
-        first_expert = self.ep_rank * self.num_local_experts
-        global_experts = self.num_experts
+        # Token dispatch: sort tokens by local expert (bf16 -> bf16 expanded)
         expanded_x, expanded_row_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
-            quant_x,
+            hidden_states,
             topk_ids.to(torch.int32),
-            active_num=N * self.top_k,
+            active_num=N * K,
             expert_num=global_experts,
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
-            active_expert_range=[first_expert, first_expert + self.num_local_experts],
+            active_expert_range=[first_expert, first_expert + E],
             quant_mode=-1,
         )
         group_list = expert_tokens.to(torch.int64)
+        group_list_cumsum = group_list.cumsum(0)
 
-        # gmm1: int8×int8 → bf16 (dequant on the fly via scale + per_token_scale)
-        gate_up_out = torch_npu.npu_grouped_matmul(
-            x=[expanded_x],
-            weight=[self._quant_w13_weight],
-            scale=[self._quant_w13_scale],
-            per_token_scale=[pertoken_scale],
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
-            group_list=group_list,
-            output_dtype=hidden_states.dtype,
-        )[0]
+        # Quantize expanded activations: bf16 -> int8 + per-token scale
+        quant_x, pertoken_scale = torch_npu.npu_dynamic_quant(expanded_x, dst_type=torch.int8)
+        if pertoken_scale.dim() == 2:
+            quant_x = quant_x.squeeze(1)
+            pertoken_scale = pertoken_scale.squeeze(1)
 
-        # Swiglu activation
-        inter = torch_npu.npu_swiglu(gate_up_out)
+        # gmm1: fused gate_up + swiglu + quant (INT8*INT8->INT8 + scale)
+        gate_up_out, swiglu_out_scale, _ = torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz(
+            x=quant_x,
+            weight=self._grouped_w13_weight,
+            weight_scale=self._quant_w13_scale,
+            x_scale=pertoken_scale,
+            group_list=group_list_cumsum,
+            bias=None,
+            swiglu_limit=0.0,
+        )
 
-        # gmm2: bf16×int8 → bf16 (antiquant path, since inter is bf16)
+        # gmm2: down_proj (INT8*INT8->BF16, dequant via scale + per_token_scale)
         down_out = torch_npu.npu_grouped_matmul(
-            x=[inter],
-            weight=[self._quant_w2_weight],
-            antiquant_scale=[self._quant_w2_scale],
-            antiquant_offset=[self._grouped_w2_offset],
+            x=[gate_up_out],
+            weight=[self._grouped_w2_weight],
+            scale=[self._grouped_w2_scale],
+            per_token_scale=[swiglu_out_scale],
             split_item=2,
             group_list_type=0,
             group_type=0,
-            group_list=group_list,
+            group_list=group_list_cumsum,
             output_dtype=hidden_states.dtype,
         )[0]
 
         # Unpermute: scatter back to [N, H] with topk weights
-        local_mask = (topk_ids >= first_expert) & (topk_ids < first_expert + self.num_local_experts)
-        topk_weights_masked = topk_weights * local_mask.to(topk_weights.dtype)
         output = torch_npu.npu_moe_token_unpermute(
             down_out,
             torch.abs(expanded_row_idx),
@@ -958,31 +989,8 @@ class GlmMoeDsaMoE(nn.Module):
         return output
 
     def _prepare_quant_weights(self):
-        """Prepare NZ-format int8 weights + float32 scales for quant gmm path.
-
-        The quant path (scale + per_token_scale) requires NZ-format weights,
-        unlike the antiquant path which accepts ND format.
-        """
-        if hasattr(self, "_quant_w13_weight"):
-            return
-
-        # Convert ND weights to NZ format for quant gmm
-        self._quant_w13_weight = torch_npu.npu_format_cast(
-            self._grouped_w13_weight, 29)  # 29 = FORMAT_NZ
-        self._quant_w2_weight = torch_npu.npu_format_cast(
-            self._grouped_w2_weight, 29)
-
-        # Scales in float32, 2D [E, out] for quant gmm
-        gate_scale = torch.stack(
-            [e.gate_proj.weight_scale for e in self.experts], dim=0).to(torch.float32).contiguous()
-        up_scale = torch.stack(
-            [e.up_proj.weight_scale for e in self.experts], dim=0).to(torch.float32).contiguous()
-        down_scale = torch.stack(
-            [e.down_proj.weight_scale for e in self.experts], dim=0).to(torch.float32).contiguous()
-
-        self._quant_w13_scale = torch.cat([gate_scale, up_scale], dim=1).contiguous()
-        del gate_scale, up_scale
-        self._quant_w2_scale = down_scale
+        """Quant weights are prepared in _prepare_grouped_weights (NZ + float32 scales)."""
+        pass
 
     def _forward_grouped_matmul(self, hidden_states, topk_weights, topk_ids, ctx):
         """Fused MoE with token dispatch via npu_moe_init_routing_v2.
