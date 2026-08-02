@@ -192,12 +192,13 @@ class W8A8StaticLinear(nn.Module):
         self.weight.data = self.weight.data.transpose(0, 1).contiguous()
         self.weight.data = _maybe_trans_nz(self.weight.data)
         self.deq_scale.data = self.deq_scale.data.to(torch.float32).contiguous()
+        # Precompute reciprocal for faster quantization (mul vs div)
+        self._scale_recip = (1.0 / self.input_scale.data).to(torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scale = self.input_scale.data
-        offset = self.input_offset.data.to(torch.int8)
+        # Fused quantization: mul + round + clamp + cast (4 ops vs 6)
         quant_x = torch.clamp(
-            torch.round(x / scale).to(torch.int32) + offset,
+            torch.round(x * self._scale_recip + self.input_offset.data),
             -128, 127,
         ).to(torch.int8)
         bias = self.quant_bias
