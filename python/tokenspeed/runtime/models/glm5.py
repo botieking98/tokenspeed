@@ -377,6 +377,8 @@ class GlmMoeDsaAttention(nn.Module):
         self.o_proj.tp_size = tp_size
         self.o_proj.tp_rank = mapping.attn.tp_rank
         self.o_proj.is_row_parallel = True
+        self._tp_group_name = None
+        self._o_proj_dequant_done = False
 
         # RoPE (interleaved) - use NPU native implementation
         rope_max_pos = min(max_position_embeddings, 40960)
@@ -406,6 +408,52 @@ class GlmMoeDsaAttention(nn.Module):
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
         )
+
+    def _dequant_o_proj(self):
+        """Dequantize o_proj weight to bf16 for matmul_allreduce_add_rmsnorm fusion.
+
+        Note: weight is stored as [in, out] after process_weights_after_loading
+        (transposed from checkpoint [out, in] and converted to NZ).
+        deq_scale is [out] (not transposed).
+        """
+        if self._o_proj_dequant_done:
+            return
+        with torch.no_grad():
+            # weight is [in, out] = [1024, 6144] after transpose in process_weights
+            w_t = self.o_proj.weight.data.float()  # [in, out]
+            ds = self.o_proj.deq_scale.data.float()  # [out]
+            s = self.o_proj.input_scale.data.float()  # [1]
+            # Dequantize: w_dequant[in, out] = w_t * ds.unsqueeze(0) / s
+            w_dequant_t = w_t * ds.unsqueeze(0) / s  # [in, out]
+            # Transpose to [out, in] for matmul_allreduce_add_rmsnorm (isTransB=True)
+            self._o_proj_weight_bf16 = w_dequant_t.t().contiguous().to(torch.bfloat16)
+            # Fold bias: quant_bias (rank 0 only) + input_offset term
+            offset = self.o_proj.input_offset.data.float()
+            bias = torch.zeros_like(ds)
+            if self.o_proj.tp_rank == 0:
+                bias = bias + self.o_proj.quant_bias.data.float()
+            # offset * sum over input dim of (w_t * ds) / s
+            bias = bias + offset * (w_t * ds.unsqueeze(0)).sum(dim=0) / s
+            self._o_proj_bias_bf16 = bias.to(torch.bfloat16).contiguous()
+        self._o_proj_dequant_done = True
+
+    def _init_tp_group_name(self):
+        """Get HCCL group name for TP all_reduce fusion."""
+        if self._tp_group_name is not None:
+            return
+        try:
+            import torch.distributed as dist
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager as pg_manager,
+            )
+            group = self.mapping.attn.tp_group
+            device_group = pg_manager.get_process_group("hccl", group)
+            local_rank = dist.get_rank(group=device_group)
+            backend = device_group._get_backend(torch.device("npu"))
+            self._tp_group_name = backend.get_hccl_comm_name(local_rank)
+        except Exception as e:
+            logger.warning("TP group name init failed: %s", e)
+            self._tp_group_name = None
 
     def forward(
         self,
@@ -802,83 +850,76 @@ class GlmMoeDsaMoE(nn.Module):
         return self._mc2_group_name is not None
 
     def _forward_mc2(self, hidden_states, topk_weights, topk_ids, ctx):
-        """MC2-based MoE: dispatch + gmm + combine, no all_reduce.
+        """MC2 MoE with int8 comm (quant_mode=2) + custom op gmm.
 
-        MC2 dispatches tokens to the ranks that hold the needed experts,
-        then combines results back. This replaces init_routing + unpermute
-        + all_reduce with a single dispatch+combine round.
-        Uses antiquant path (BF16 x INT8 ND) since native W8A8 grouped_matmul
-        kernel is unavailable on this CANN version.
+        Eliminates all_reduce: dispatch+combine replaces init_routing+unpermute+all_reduce.
+        quant_mode=2 enables int8 communication (4x less data than bf16).
+        Dispatch returns int8 expand_x + dynamic_scale, fed directly to custom op.
         """
         N = hidden_states.shape[0]
 
         self._prepare_grouped_weights()
 
-        # No padding: pass N tokens directly. Mask = ones(N), global_bs=0.
         if not hasattr(self, "_mc2_mask") or self._mc2_mask.shape[0] != N:
             self._mc2_mask = torch.ones(N, dtype=torch.bool, device=hidden_states.device)
 
-        # MC2 dispatch: send tokens to ranks with needed experts.
+        # MC2 dispatch with int8 communication
         dispatch_out = torch_npu.npu_moe_distribute_dispatch_v2(
-                x=hidden_states,
-                expert_ids=topk_ids.to(torch.int32),
-                expert_shard_type=0,
-                shared_expert_rank_num=0,
-                moe_expert_num=self.num_experts,
-                global_bs=0,
-                expert_token_nums_type=0,
-                x_active_mask=self._mc2_mask,
-                scales=None,
-                quant_mode=0,
-                group_ep=self._mc2_group_name,
-                ep_world_size=self._ep_world_size,
-                ep_rank_id=self._ep_rank_id,
-                group_tp=self._mc2_group_name,
-                tp_world_size=1,
-                tp_rank_id=0,
-            )
-        expand_x = dispatch_out[0]
+            x=hidden_states,
+            expert_ids=topk_ids.to(torch.int32),
+            expert_shard_type=0,
+            shared_expert_rank_num=0,
+            moe_expert_num=self.num_experts,
+            global_bs=0,
+            expert_token_nums_type=0,
+            x_active_mask=self._mc2_mask,
+            scales=None,
+            quant_mode=2,
+            group_ep=self._mc2_group_name,
+            ep_world_size=self._ep_world_size,
+            ep_rank_id=self._ep_rank_id,
+            group_tp=self._mc2_group_name,
+            tp_world_size=1,
+            tp_rank_id=0,
+        )
+        expand_x = dispatch_out[0]       # int8 [N_exp, hidden]
+        dynamic_scale = dispatch_out[1]  # per-token scale [N_exp]
         assist_info_for_combine = dispatch_out[2]
         expert_token_nums = dispatch_out[3]
         ep_recv_counts = dispatch_out[4]
         expand_scales = dispatch_out[6]
 
-        # The antiquant gmm requires group_list of length == num_local_experts
-        # (to match the per-expert antiquant_scale batch). MC2 dispatch may
-        # return a shorter tensor when fewer experts are active on this rank.
-        # Pad cumsum with the last value (remaining experts have 0 tokens).
+        # Build cumsum group_list padded to num_local_experts
         group_list = expert_token_nums.to(torch.int64)
         if group_list.numel() < self.num_local_experts:
             pad_len = self.num_local_experts - group_list.numel()
             if group_list.numel() > 0:
-                group_list = torch.cat([
-                    group_list, group_list[-1:].repeat(pad_len)])
+                group_list = torch.cat([group_list, group_list[-1:].repeat(pad_len)])
             else:
                 group_list = torch.zeros(self.num_local_experts,
                     dtype=torch.int64, device=hidden_states.device)
 
-        # gmm1: fused gate_up_proj (antiquant: BF16 x INT8 ND)
-        gate_up_out = torch_npu.npu_grouped_matmul(
-            x=[expand_x],
-            weight=[self._grouped_w13_weight],
-            antiquant_scale=[self._grouped_w13_scale],
-            antiquant_offset=[self._grouped_w13_offset],
-            split_item=2,
-            group_list_type=0,
-            group_type=0,
+        # Squeeze dynamic_scale if 2D
+        if dynamic_scale.dim() == 2:
+            dynamic_scale = dynamic_scale.squeeze(1)
+
+        # gmm1: fused gate_up + swiglu + quant (INT8*INT8->INT8 + scale)
+        gate_up_out, swiglu_out_scale, _ = torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz(
+            x=expand_x,
+            weight=self._grouped_w13_weight,
+            weight_scale=self._quant_w13_scale,
+            x_scale=dynamic_scale,
             group_list=group_list,
-            output_dtype=hidden_states.dtype,
-        )[0]
+            bias=None,
+            swiglu_limit=0.0,
+        )
 
-        # Fused swiglu
-        inter = torch_npu.npu_swiglu(gate_up_out)
-
-        # gmm2: down_proj (antiquant)
+        # gmm2: down_proj (INT8*INT8->BF16, dequant via scale + per_token_scale)
         down_out = torch_npu.npu_grouped_matmul(
-            x=[inter],
+            x=[gate_up_out],
             weight=[self._grouped_w2_weight],
-            antiquant_scale=[self._grouped_w2_scale],
-            antiquant_offset=[self._grouped_w2_offset],
+            scale=[self._grouped_w2_scale],
+            per_token_scale=[swiglu_out_scale],
             split_item=2,
             group_list_type=0,
             group_type=0,
@@ -886,8 +927,7 @@ class GlmMoeDsaMoE(nn.Module):
             output_dtype=hidden_states.dtype,
         )[0]
 
-        # MC2 combine: send results back and combine with topk_weights.
-        # A3 requires tp_send_counts/group_tp/tp_world_size/tp_rank_id.
+        # MC2 combine with int8 communication
         output = torch_npu.npu_moe_distribute_combine_v2(
             expand_x=down_out,
             expert_ids=topk_ids.to(torch.int32),
@@ -902,7 +942,7 @@ class GlmMoeDsaMoE(nn.Module):
             ep_world_size=self._ep_world_size,
             ep_rank_id=self._ep_rank_id,
             expand_scales=expand_scales,
-            comm_quant_mode=0,
+            comm_quant_mode=2,
             assist_info_for_combine=assist_info_for_combine,
             tp_send_counts=ep_recv_counts,
             group_tp=self._mc2_group_name,
