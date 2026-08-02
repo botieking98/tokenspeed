@@ -826,18 +826,44 @@ class GlmMoeDsaMoE(nn.Module):
         topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
+    _shared_expert_stream = None
+
     def forward(self, hidden_states: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         router_logits = self.gate(hidden_states)
         topk_weights, topk_ids = self._select_experts(hidden_states, router_logits)
 
         if _CUSTOM_OPS_LOADED:
-            output = self._forward_quant_gmm(hidden_states, topk_weights, topk_ids, ctx)
+            # Compute MoE without all_reduce, overlap shared_experts with all_reduce
+            moe_output = self._forward_quant_gmm(
+                hidden_states, topk_weights, topk_ids, ctx, skip_allreduce=True)
+
+            if self.shared_experts is not None:
+                # Launch shared_experts on a separate stream to overlap with all_reduce
+                if GlmMoeDsaMoE._shared_expert_stream is None:
+                    GlmMoeDsaMoE._shared_expert_stream = torch_npu.npu.Stream(
+                        device=hidden_states.device)
+                se_stream = GlmMoeDsaMoE._shared_expert_stream
+                # Record event on default stream after MoE compute
+                moe_done = torch.npu.current_stream().record_event()
+                # shared_experts stream waits for MoE compute to finish
+                se_stream.wait_event(moe_done)
+                with torch_npu.npu.stream(se_stream):
+                    shared_output = self.shared_experts(hidden_states)
+                # Launch all_reduce on default stream (overlaps with shared_experts)
+                if self.ep_size > 1:
+                    moe_output = all_reduce(moe_output, self.mapping.attn.tp_group)
+                # Wait for shared_experts to finish
+                torch.npu.current_stream().wait_stream(se_stream)
+                output = moe_output + shared_output
+            else:
+                if self.ep_size > 1:
+                    moe_output = all_reduce(moe_output, self.mapping.attn.tp_group)
+                output = moe_output
         else:
             output = self._forward_grouped_matmul(hidden_states, topk_weights, topk_ids, ctx)
-
-        if self.shared_experts is not None:
-            output = output + self.shared_experts(hidden_states)
+            if self.shared_experts is not None:
+                output = output + self.shared_experts(hidden_states)
         return output
 
     def _mc2_available(self):
@@ -985,7 +1011,7 @@ class GlmMoeDsaMoE(nn.Module):
 
         return output
 
-    def _forward_quant_gmm(self, hidden_states, topk_weights, topk_ids, ctx):
+    def _forward_quant_gmm(self, hidden_states, topk_weights, topk_ids, ctx, skip_allreduce=False):
         """Quantized MoE: INT8×INT8 via _C_ascend custom ops.
 
         Routes bf16 tokens, quantizes to int8, then uses:
@@ -1056,7 +1082,7 @@ class GlmMoeDsaMoE(nn.Module):
             probs=topk_weights_masked.to(torch.bfloat16),
         )
 
-        if self.ep_size > 1:
+        if self.ep_size > 1 and not skip_allreduce:
             output = all_reduce(output, self.mapping.attn.tp_group)
 
         return output
