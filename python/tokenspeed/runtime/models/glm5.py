@@ -376,7 +376,6 @@ class GlmMoeDsaAttention(nn.Module):
         self._tp_group_name = None
         self._o_proj_dequant_done = False
         self._qkv_a_fused = False
-        self._kv_b_int8_ready = False
 
         # RoPE (interleaved) - use NPU native implementation
         rope_max_pos = min(max_position_embeddings, 40960)
@@ -405,38 +404,6 @@ class GlmMoeDsaAttention(nn.Module):
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
-        )
-
-    def _convert_kv_b_to_int8(self):
-        """Convert kv_b_proj bf16 weight to int8 for faster int8 cube matmul.
-
-        Saves bf16 weight for decode q_absorption, converts to int8 for prefill matmul.
-        """
-        if self._kv_b_int8_ready:
-            return
-        with torch.no_grad():
-            w = self.kv_b_proj.weight.data  # [out, in] bf16
-            # Save bf16 weight for decode q_absorption einsum
-            w_kv = w.view(self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
-            self._w_kc = w_kv[:, :self.qk_nope_head_dim, :].contiguous().to(torch.bfloat16)
-            # Quantize to int8 for prefill matmul
-            abs_max = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
-            scale = (abs_max / 127.0).to(torch.float32)
-            quant_w = torch.round(w / scale).clamp(-128, 127).to(torch.int8)
-            self._kv_b_w_int8 = _maybe_trans_nz(quant_w.transpose(0, 1).contiguous())
-            self._kv_b_scale = scale.flatten().contiguous()
-        self._kv_b_int8_ready = True
-
-    def _kv_b_proj_int8(self, x):
-        """int8 dynamic quant matmul for kv_b_proj."""
-        self._convert_kv_b_to_int8()
-        quant_x, pertoken_scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
-        if pertoken_scale.dim() == 2:
-            quant_x = quant_x.squeeze(1)
-            pertoken_scale = pertoken_scale.squeeze(1)
-        return torch_npu.npu_quant_matmul(
-            quant_x, self._kv_b_w_int8, self._kv_b_scale,
-            pertoken_scale=pertoken_scale, output_dtype=x.dtype,
         )
 
     def _maybe_fuse_qkv_a(self):
@@ -531,7 +498,6 @@ class GlmMoeDsaAttention(nn.Module):
         num_prefill_tokens = num_tokens - num_decode_tokens
 
         # Fused Q + KV projection (one quantize + one matmul)
-        self._convert_kv_b_to_int8()
         self._maybe_fuse_qkv_a()
         if pre_quantized:
             quant_x = hidden_states
@@ -594,7 +560,7 @@ class GlmMoeDsaAttention(nn.Module):
         kv_a = latent_cache[..., :self.kv_lora_rank]
         k_pe = latent_cache[..., self.kv_lora_rank:]
         kv_a_norm, _ = torch_npu.npu_rms_norm(kv_a, self.kv_a_layernorm.weight, epsilon=self.kv_a_layernorm.variance_epsilon)
-        kv = self._kv_b_proj_int8(kv_a_norm)  # [N, local_heads*(qk_nope+v)]
+        kv = self.kv_b_proj(kv_a_norm)  # [N, local_heads*(qk_nope+v)]
         kv = kv.view(N, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope = kv[..., :self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim:]
@@ -628,7 +594,11 @@ class GlmMoeDsaAttention(nn.Module):
         q_pe = q[..., self.qk_nope_head_dim:]
         q_nope = q[..., :self.qk_nope_head_dim]
 
-        self._convert_kv_b_to_int8()
+        # Precomputed q_absorb weight (avoid per-step reshape/slice)
+        if not hasattr(self, '_w_kc'):
+            w_kv = self.kv_b_proj.weight
+            w_kv = w_kv.view(self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+            self._w_kc = w_kv[:, :self.qk_nope_head_dim, :].contiguous()
         q_absorbed = torch.einsum("nhd,hdk->nhk", q_nope, self._w_kc)
 
         # Apply RMSNorm to kv_a
