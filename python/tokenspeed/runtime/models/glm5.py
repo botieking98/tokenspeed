@@ -432,6 +432,11 @@ class GlmMoeDsaAttention(nn.Module):
             self._qkv_a_input_scale = self.q_a_proj.input_scale.data
             self._qkv_a_input_offset = self.q_a_proj.input_offset.data
             self._q_lora_rank = self.q_a_proj.out_features
+            # Precompute expanded quant params for npu_add_rms_norm_quant
+            # (requires float32 scale and int32 offset, broadcast to [hidden_size])
+            hidden_size = self.q_a_proj.in_features
+            self._qkv_a_quant_scale_f32 = self._qkv_a_input_scale.expand(hidden_size).contiguous()
+            self._qkv_a_quant_offset_i32 = self._qkv_a_input_offset.to(torch.int32).expand(hidden_size).contiguous()
         self._qkv_a_fused = True
 
     def _dequant_o_proj(self):
@@ -486,7 +491,9 @@ class GlmMoeDsaAttention(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        pre_quantized: bool = False,
     ) -> torch.Tensor:
+        orig_dtype = torch.bfloat16 if pre_quantized else hidden_states.dtype
         num_tokens = hidden_states.shape[0]
         num_decodes = ctx.bs - ctx.num_extends
         num_decode_tokens = num_decodes * ctx.attn_backend.spec_num_tokens
@@ -494,14 +501,17 @@ class GlmMoeDsaAttention(nn.Module):
 
         # Fused Q + KV projection (one quantize + one matmul)
         self._maybe_fuse_qkv_a()
-        quant_x = torch_npu.npu_quantize(
-            hidden_states, self._qkv_a_input_scale,
-            self._qkv_a_input_offset.to(torch.int8),
-            torch.qint8, axis=1, div_mode=True,
-        )
+        if pre_quantized:
+            quant_x = hidden_states
+        else:
+            quant_x = torch_npu.npu_quantize(
+                hidden_states, self._qkv_a_input_scale,
+                self._qkv_a_input_offset.to(torch.int8),
+                torch.qint8, axis=1, div_mode=True,
+            )
         qkv_a = torch_npu.npu_quant_matmul(
             quant_x, self._qkv_a_weight, self._qkv_a_deq_scale,
-            bias=self._qkv_a_quant_bias, output_dtype=hidden_states.dtype,
+            bias=self._qkv_a_quant_bias, output_dtype=orig_dtype,
         )
         q_a = qkv_a[..., :self._q_lora_rank]
         latent_cache = qkv_a[..., self._q_lora_rank:]
@@ -512,7 +522,7 @@ class GlmMoeDsaAttention(nn.Module):
 
         attn_output = torch.empty(
             num_tokens, self.num_local_heads * self.v_head_dim,
-            dtype=hidden_states.dtype, device=hidden_states.device,
+            dtype=orig_dtype, device=hidden_states.device,
         )
 
         if num_prefill_tokens > 0:
@@ -1365,14 +1375,26 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, positions, hidden_states, ctx, out_cache_loc, residual):
+        pre_quantized = False
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif not ctx.forward_mode.is_idle():
+            # Fuse add + rms_norm + quant: produces int8 for attention qkv_a
+            # and new residual in one kernel, saving 2 kernel launches/layer.
+            self.self_attn._maybe_fuse_qkv_a()
+            hidden_states, _, residual = torch_npu.npu_add_rms_norm_quant(
+                hidden_states, residual, self.input_layernorm.weight.data,
+                self.self_attn._qkv_a_quant_scale_f32,
+                self.self_attn._qkv_a_quant_offset_i32,
+                None, epsilon=self.input_layernorm.variance_epsilon,
+            )
+            pre_quantized = True
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if not ctx.forward_mode.is_idle():
-            hidden_states = self.self_attn(positions, hidden_states, ctx, out_cache_loc)
+            hidden_states = self.self_attn(positions, hidden_states, ctx, out_cache_loc, pre_quantized=pre_quantized)
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             if self.is_moe_layer:
                 hidden_states = self.mlp(hidden_states, ctx)
