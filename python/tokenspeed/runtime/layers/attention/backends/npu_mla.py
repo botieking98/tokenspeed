@@ -375,8 +375,9 @@ class NPUMlaAttnBackend(AttentionBackend):
 
         # V decompression: [H, N, kv_lora] @ [H, kv_lora, v] -> [H, N, v]
         attn_output = attn_output.view(self.num_local_heads, num_tokens, self.kv_lora_rank)
-        v_output = torch.bmm(attn_output, w_uv)
-        v_output = v_output.permute(1, 0, 2).contiguous()
+        # npu_transpose_batchmatmul fuses bmm + output transpose (perm_y),
+        # eliminating the .permute().contiguous() full copy per layer.
+        v_output = torch_npu.npu_transpose_batchmatmul(attn_output, w_uv, perm_y=(1, 0, 2))
 
         return v_output.reshape(num_tokens, self.num_local_heads * self.v_head_dim)
 
