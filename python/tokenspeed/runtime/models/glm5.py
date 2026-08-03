@@ -1118,13 +1118,13 @@ class GlmMoeDsaMoE(nn.Module):
 
         # Mask topk_weights for non-local experts (pre-cast to bf16 for unpermute)
         local_mask = (topk_ids >= first_expert) & (topk_ids < first_expert + E)
-        topk_weights_masked = (topk_weights * local_mask.to(topk_weights.dtype)).to(torch.bfloat16)
+        topk_weights_masked = topk_weights * local_mask.to(topk_weights.dtype)
 
         # Token dispatch with fused dynamic quant (quant_mode=1):
         # bf16 → int8 expanded_x + per-token scale in one kernel
         expanded_x, expanded_row_idx, expert_tokens, expanded_scale = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
-            topk_ids.to(torch.int32),
+            topk_ids,
             active_num=N * K,
             expert_num=global_experts,
             expert_tokens_num_type=1,
@@ -1132,8 +1132,7 @@ class GlmMoeDsaMoE(nn.Module):
             active_expert_range=[first_expert, first_expert + E],
             quant_mode=1,
         )
-        group_list = expert_tokens.to(torch.int64)
-        group_list_cumsum = group_list.cumsum(0)
+        group_list_cumsum = expert_tokens.cumsum(0)
 
         # expanded_x is already int8, expanded_scale is per-token scale
         quant_x = expanded_x
@@ -1201,7 +1200,7 @@ class GlmMoeDsaMoE(nn.Module):
         # Token dispatch: sort tokens by local expert
         expanded_x, expanded_row_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
-            topk_ids.to(torch.int32),
+            topk_ids,
             active_num=N * K,
             expert_num=global_experts,
             expert_tokens_num_type=1,   # count mode
@@ -1246,7 +1245,7 @@ class GlmMoeDsaMoE(nn.Module):
         output = torch_npu.npu_moe_token_unpermute(
             down_out,
             torch.abs(expanded_row_idx),
-            probs=topk_weights_masked.to(torch.bfloat16),
+            probs=topk_weights_masked,
         )
 
         # all_reduce on attn.tp_group
