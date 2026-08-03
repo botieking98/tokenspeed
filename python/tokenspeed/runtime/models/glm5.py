@@ -920,30 +920,29 @@ class GlmMoeDsaMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
+
+        if _CUSTOM_OPS_LOADED and self.shared_experts is not None:
+            # Launch shared_experts early on se_stream to overlap with the
+            # entire MoE pipeline (gate + routing + gmm + unpermute + all_reduce).
+            # shared_experts only needs hidden_states, not moe_output.
+            if GlmMoeDsaMoE._shared_expert_stream is None:
+                GlmMoeDsaMoE._shared_expert_stream = torch_npu.npu.Stream(
+                    device=hidden_states.device)
+            se_stream = GlmMoeDsaMoE._shared_expert_stream
+            hs_ready = torch.npu.current_stream().record_event()
+            se_stream.wait_event(hs_ready)
+            with torch_npu.npu.stream(se_stream):
+                shared_output = self.shared_experts(hidden_states)
+
         router_logits = self.gate(hidden_states)
         topk_weights, topk_ids = self._select_experts(hidden_states, router_logits)
 
         if _CUSTOM_OPS_LOADED:
-            # Compute MoE without all_reduce, overlap shared_experts with all_reduce
             moe_output = self._forward_quant_gmm(
                 hidden_states, topk_weights, topk_ids, ctx, skip_allreduce=True)
-
             if self.shared_experts is not None:
-                # Launch shared_experts on a separate stream to overlap with all_reduce
-                if GlmMoeDsaMoE._shared_expert_stream is None:
-                    GlmMoeDsaMoE._shared_expert_stream = torch_npu.npu.Stream(
-                        device=hidden_states.device)
-                se_stream = GlmMoeDsaMoE._shared_expert_stream
-                # Record event on default stream after MoE compute
-                moe_done = torch.npu.current_stream().record_event()
-                # shared_experts stream waits for MoE compute to finish
-                se_stream.wait_event(moe_done)
-                with torch_npu.npu.stream(se_stream):
-                    shared_output = self.shared_experts(hidden_states)
-                # Launch all_reduce on default stream (overlaps with shared_experts)
                 if self.ep_size > 1:
                     moe_output = all_reduce(moe_output, self.mapping.attn.tp_group)
-                # Wait for shared_experts to finish
                 torch.npu.current_stream().wait_stream(se_stream)
                 output = moe_output + shared_output
             else:
