@@ -589,7 +589,7 @@ class GlmMoeDsaAttention(nn.Module):
             w_kv = self.kv_b_proj.weight
             w_kv = w_kv.view(self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
             self._w_kc = w_kv[:, :self.qk_nope_head_dim, :].contiguous()
-        q_absorbed = torch.einsum("nhd,hdk->nhk", q_nope, self._w_kc)
+        q_absorbed = torch.bmm(q_nope.transpose(0, 1), self._w_kc).transpose(0, 1)
 
         # Apply RMSNorm to kv_a
         kv_a = latent_cache[..., :self.kv_lora_rank]
@@ -600,18 +600,10 @@ class GlmMoeDsaAttention(nn.Module):
         )
         q_pe_rotated, k_pe_rotated = self.rotary_emb(positions, q_pe, k_pe)
 
-        # Pre-allocate Q and K (avoid torch.cat)
         kv_lora = self.kv_lora_rank
         rope_dim = self.qk_rope_head_dim
-        Q = torch.empty(q_absorbed.shape[0], self.num_local_heads, kv_lora + rope_dim,
-                        dtype=q_absorbed.dtype, device=q_absorbed.device)
-        Q[..., :kv_lora] = q_absorbed
-        Q[..., kv_lora:] = q_pe_rotated
-
-        K = torch.empty(kv_a_norm.shape[0], kv_lora + rope_dim,
-                        dtype=kv_a_norm.dtype, device=kv_a_norm.device)
-        K[..., :kv_lora] = kv_a_norm
-        K[..., kv_lora:] = k_pe_rotated
+        Q = torch.cat([q_absorbed, q_pe_rotated], dim=-1)
+        K = torch.cat([kv_a_norm, k_pe_rotated], dim=-1)
 
         # Write KV cache (ROTATED k_pe)
         ctx.token_to_kv_pool.set_mla_kv_buffer(
