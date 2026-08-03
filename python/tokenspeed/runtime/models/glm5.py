@@ -642,7 +642,10 @@ class GlmMoeDsaAttention(nn.Module):
             w_kv = self.kv_b_proj.weight
             w_kv = w_kv.view(self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
             self._w_kc = w_kv[:, :self.qk_nope_head_dim, :].contiguous()
-        q_absorbed = torch.bmm(q_nope.transpose(0, 1), self._w_kc).transpose(0, 1)
+        # npu_transpose_batchmatmul fuses bmm + input/output transpose,
+        # producing contiguous [N, H, kv_lora] without intermediate copy.
+        q_absorbed = torch_npu.npu_transpose_batchmatmul(
+            q_nope, self._w_kc, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
 
         # Apply RMSNorm to kv_a
         kv_a = latent_cache[..., :self.kv_lora_rank]
@@ -890,16 +893,28 @@ class GlmMoeDsaMoE(nn.Module):
         return out
 
     def _select_experts(self, hidden_states, router_logits):
-        """sigmoid scoring + noaux_tc topk."""
-        scores = torch.sigmoid(router_logits)
-        scores_for_selection = scores + self.e_score_correction_bias.unsqueeze(0)
-        topk_weights, topk_ids = torch.topk(
-            scores_for_selection, self.top_k, dim=-1, largest=True
+        """Fused MoE gating top-k via npu_moe_gating_top_k.
+
+        Replaces 8 separate kernels (sigmoid + bias + topk + norm + scale +
+        casts) with a single fused NPU kernel. The fused kernel uses unbiased
+        sigmoid scores for routing weights (bias only affects expert selection),
+        matching vllm-ascend grouped-topk behavior.
+        """
+        if not hasattr(self, "_bias_cast"):
+            self._bias_cast = self.e_score_correction_bias.to(router_logits.dtype)
+        topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+            router_logits,
+            k=self.top_k,
+            bias=self._bias_cast,
+            k_group=1,
+            group_count=1,
+            group_select_mode=1,
+            renorm=0,
+            norm_type=1,
+            routed_scaling_factor=self.routed_scaling_factor,
+            eps=1e-20,
         )
-        if self.config.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        return topk_weights, topk_ids
 
     _shared_expert_stream = None
 
