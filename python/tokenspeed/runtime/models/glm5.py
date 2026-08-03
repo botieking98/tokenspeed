@@ -444,6 +444,21 @@ class GlmMoeDsaAttention(nn.Module):
             self._qkv_a_quant_offset_i32 = self._qkv_a_input_offset.to(torch.int32).expand(hidden_size).contiguous()
         self._qkv_a_fused = True
 
+    def _maybe_prepare_q_b_quant(self):
+        """Precompute expanded quant params for q_b_proj to enable
+        npu_add_rms_norm_quant fusion (rms_norm + quantize in one kernel).
+
+        Uses npu_add_rms_norm_quant with x2=zeros to achieve rms_norm+quant
+        without precision loss (float32 scale, unlike npu_rms_norm_quant
+        which requires bf16 scale). Saves 1 kernel launch per layer.
+        """
+        if hasattr(self, "_q_b_scale_expanded"):
+            return
+        with torch.no_grad():
+            q_lora = self.q_lora_rank
+            self._q_b_scale_expanded = self.q_b_proj.input_scale.data.expand(q_lora).contiguous()
+            self._q_b_offset_expanded = self.q_b_proj.input_offset.data.to(torch.int32).expand(q_lora).contiguous()
+
     def _dequant_o_proj(self):
         """Dequantize o_proj weight to bf16 for matmul_allreduce_add_rmsnorm fusion.
 
@@ -521,8 +536,25 @@ class GlmMoeDsaAttention(nn.Module):
         q_a = qkv_a[..., :self._q_lora_rank]
         latent_cache = qkv_a[..., self._q_lora_rank:]
 
-        q_norm = self.q_a_layernorm(q_a)
-        q = self.q_b_proj(q_norm)
+        # Fuse q_a RMSNorm + q_b_proj quantize via npu_add_rms_norm_quant
+        # (x2=zeros → add 0 is identity), saving 1 kernel per layer.
+        self._maybe_prepare_q_b_quant()
+        if not hasattr(self, "_q_a_zeros") or self._q_a_zeros.shape[0] < num_tokens:
+            self._q_a_zeros = torch.zeros(
+                num_tokens, self.q_lora_rank,
+                dtype=torch.bfloat16, device=q_a.device,
+            )
+        q_quant, _, _ = torch_npu.npu_add_rms_norm_quant(
+            q_a, self._q_a_zeros[:num_tokens],
+            self.q_a_layernorm.weight.data,
+            self._q_b_scale_expanded, self._q_b_offset_expanded,
+            None, epsilon=self.q_a_layernorm.variance_epsilon,
+            div_mode=True,
+        )
+        q = torch_npu.npu_quant_matmul(
+            q_quant, self.q_b_proj.weight, self.q_b_proj.deq_scale,
+            bias=self.q_b_proj.quant_bias, output_dtype=orig_dtype,
+        )
         q = q.view(num_tokens, self.num_local_heads, self.qk_head_dim)
 
         if num_prefill_tokens > 0 and num_decode_tokens > 0:
