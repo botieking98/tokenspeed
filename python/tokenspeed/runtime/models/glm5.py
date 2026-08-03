@@ -90,6 +90,14 @@ class NPURotaryEmbedding:
     invariant so both Q and K can use split-half format.
     """
 
+    # Class-level shared indexed cos/sin — all layers use the same rope
+    # parameters and the same positions tensor per forward pass, so the
+    # gather (cos_cache[positions]) only needs to run once. The first
+    # layer's __call__ computes and caches; subsequent layers reuse.
+    _shared_cos = None
+    _shared_sin = None
+    _shared_positions_ptr = None
+
     def __init__(self, head_size: int, base: float, max_position: int):
         self.head_size = head_size
         self.base = base
@@ -133,8 +141,17 @@ class NPURotaryEmbedding:
         Returns: (q_rotated, k_rotated) in split-half layout.
         """
         self._ensure_cache(q.device, q.dtype)
-        cos = self._cos_cache[positions]
-        sin = self._sin_cache[positions]
+        ptr = positions.data_ptr()
+        n = positions.shape[0]
+        if (NPURotaryEmbedding._shared_positions_ptr != ptr
+                or NPURotaryEmbedding._shared_cos is None
+                or NPURotaryEmbedding._shared_cos.shape[0] != n
+                or NPURotaryEmbedding._shared_cos.device != q.device):
+            NPURotaryEmbedding._shared_cos = self._cos_cache[positions]
+            NPURotaryEmbedding._shared_sin = self._sin_cache[positions]
+            NPURotaryEmbedding._shared_positions_ptr = ptr
+        cos = NPURotaryEmbedding._shared_cos
+        sin = NPURotaryEmbedding._shared_sin
         q_out = self._apply_rope_op(q, cos, sin)
         k_out = self._apply_rope_op(k, cos, sin)
         return q_out, k_out
@@ -1417,6 +1434,9 @@ class GlmMoeDsaModel(nn.Module):
         self.layers_to_capture: set = set()
 
     def forward(self, input_ids, positions, ctx, out_cache_loc, **kwargs):
+        # Invalidate shared cos/sin cache — positions may reuse the same
+        # buffer across forward passes with different values.
+        NPURotaryEmbedding._shared_positions_ptr = None
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
