@@ -273,15 +273,21 @@ class NPUMlaAttnBackend(AttentionBackend):
         q_nope = q_nope.reshape(num_tokens, self.num_local_heads, 1, self.kv_lora_rank).contiguous()
         q_pe = q_pe.reshape(num_tokens, self.num_local_heads, 1, self.qk_rope_head_dim)
 
-        # KV cache: [total_tokens, 1, kv_cache_dim] -> [num_blocks, 1, block_size, kv_cache_dim]
+        # KV cache: separate k_nope and k_pe buffers (already contiguous)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         block_size = self.page_size
-        num_blocks = kv_cache.shape[0] // block_size
-        kv_cache = kv_cache[: num_blocks * block_size].view(
-            num_blocks, 1, block_size, self.kv_cache_dim
+        if isinstance(kv_cache, tuple):
+            k_nope_full, k_pe_full = kv_cache
+        else:
+            k_nope_full = kv_cache[..., : self.kv_lora_rank]
+            k_pe_full = kv_cache[..., self.kv_lora_rank :]
+        num_blocks = k_nope_full.shape[0] // block_size
+        k_nope = k_nope_full[: num_blocks * block_size].view(
+            num_blocks, 1, block_size, self.kv_lora_rank
         )
-        k_nope = kv_cache[..., : self.kv_lora_rank].contiguous()
-        k_pe = kv_cache[..., self.kv_lora_rank :].contiguous()
+        k_pe = k_pe_full[: num_blocks * block_size].view(
+            num_blocks, 1, block_size, self.qk_rope_head_dim
+        )
 
         # V decompression weight from kv_b_proj (cached to avoid per-step .contiguous())
         kv_b_proj = getattr(layer, "kv_b_proj", None)

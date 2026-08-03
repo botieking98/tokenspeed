@@ -106,11 +106,20 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                     for _ in range(layer_num)
                 ]
             else:
+                # Store k_nope and k_pe as separate contiguous buffers to
+                # avoid .contiguous() copies in attention decode path.
                 self.kv_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=device,
+                    (
+                        torch.zeros(
+                            (self.size + self.page_size, 1, self.kv_lora_rank),
+                            dtype=self.store_dtype,
+                            device=device,
+                        ),
+                        torch.zeros(
+                            (self.size + self.page_size, 1, self.qk_rope_head_dim),
+                            dtype=self.store_dtype,
+                            device=device,
+                        ),
                     )
                     for _ in range(layer_num)
                 ]
@@ -123,8 +132,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 # Each layer has 3 tensors
                 all_buffers.extend(layer_buffers)
         else:
-            # kv_buffer is a list of single tensors
-            all_buffers = self.kv_buffer
+            # kv_buffer is a list of (k_nope, k_pe) tuples
+            for layer_buffers in self.kv_buffer:
+                all_buffers.extend(layer_buffers)
 
         self.data_ptrs = torch.tensor(
             [buf.data_ptr() for buf in all_buffers],
@@ -261,12 +271,21 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 for sub_tuple in self.kv_buffer
             ]
         else:
-            # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-            kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
-            kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+            # Split MLA cache: k_nope and k_pe are separate buffers per layer
+            kv_data_ptrs = [
+                buf.data_ptr()
+                for layer_buffers in self.kv_buffer
+                for buf in layer_buffers
+            ]
+            kv_data_lens = [
+                buf.nbytes
+                for layer_buffers in self.kv_buffer
+                for buf in layer_buffers
+            ]
             kv_item_lens = [
-                self.kv_buffer[i][0].nbytes * self.page_size
-                for i in range(self.layer_num)
+                buf[0].nbytes * self.page_size
+                for buf in self.kv_buffer
+                for _ in range(2)  # 2 buffers per layer
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
@@ -277,7 +296,10 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 for layer_id in range(self.layer_num)
             ]
         else:
-            return [[start_idx + layer_id] for layer_id in range(self.layer_num)]
+            return [
+                [start_idx + layer_id * 2, start_idx + layer_id * 2 + 1]
+                for layer_id in range(self.layer_num)
+            ]
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -285,7 +307,8 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         if self.quant_method == "per_token_head":
             return self.kv_buffer[layer_id]
         elif self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id].view(self.dtype)
+            k_nope, k_pe = self.kv_buffer[layer_id]
+            return k_nope.view(self.dtype), k_pe.view(self.dtype)
         else:
             return self.kv_buffer[layer_id]
 
@@ -295,9 +318,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         if self.quant_method == "per_token_head":
             return self.kv_buffer[layer_id][:2]
         elif self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id][..., : self.kv_lora_rank].view(self.dtype)
+            return self.kv_buffer[layer_id][0].view(self.dtype)
         else:
-            return self.kv_buffer[layer_id][..., : self.kv_lora_rank]
+            return self.kv_buffer[layer_id][0]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -349,13 +372,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id],
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-                enable_pdl=pdl_enabled(),
-            )
+            k_nope_buf, k_pe_buf = self.kv_buffer[layer_id]
+            k_nope_buf[loc] = cache_k_nope.view(-1, 1, self.kv_lora_rank)
+            k_pe_buf[loc] = cache_k_rope.view(-1, 1, self.qk_rope_head_dim)
 
     def get_mla_kv_buffer(
         self,
@@ -375,20 +394,12 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             cache_k_rope = (k_rope * k_scale).to(dst_dtype).contiguous()
             return cache_k_nope, cache_k_rope
 
-        kv_buffer = self.get_key_buffer(layer_id)
-        cache_k_nope = torch.empty(
-            (loc.shape[0], 1, self.kv_lora_rank),
-            dtype=dst_dtype,
-            device=kv_buffer.device,
-        )
-        cache_k_rope = torch.empty(
-            (loc.shape[0], 1, self.qk_rope_head_dim),
-            dtype=dst_dtype,
-            device=kv_buffer.device,
-        )
-        get_mla_kv_buffer_triton(
-            kv_buffer, loc, cache_k_nope, cache_k_rope, enable_pdl=pdl_enabled()
-        )
+        k_nope_buf, k_pe_buf = self.kv_buffer[layer_id]
+        if self.store_dtype != self.dtype:
+            k_nope_buf = k_nope_buf.view(self.dtype)
+            k_pe_buf = k_pe_buf.view(self.dtype)
+        cache_k_nope = k_nope_buf[loc].to(dst_dtype)
+        cache_k_rope = k_pe_buf[loc].to(dst_dtype)
         return cache_k_nope, cache_k_rope
 
     def get_cpu_copy(self, token_indices: list[int]) -> torch.Tensor:
@@ -406,10 +417,13 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                         ]
                     )
                 else:
-                    kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
+                    k_nope_cpu = self.kv_buffer[layer_id][0][chunk_indices].to(
                         "cpu", non_blocking=True
                     )
-                    kv_cache_cpu[-1].append([kv_cpu])
+                    k_pe_cpu = self.kv_buffer[layer_id][1][chunk_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                    kv_cache_cpu[-1].append([k_nope_cpu, k_pe_cpu])
         self.device_module.synchronize()
         return kv_cache_cpu
 
@@ -428,10 +442,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                             self.kv_buffer[0][0].device, non_blocking=True
                         )
                 else:
-                    kv_cpu = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][0]
-                    assert kv_cpu.shape[0] == len(
-                        chunk_indices
-                    ), f"kv_cpu.shape[0] {kv_cpu.shape[0]} != len(chunk_indices) {len(chunk_indices)}"
-                    kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
-                    self.kv_buffer[layer_id][chunk_indices] = kv_chunk
+                    k_nope_cpu = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][0]
+                    k_pe_cpu = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][1]
+                    k_nope_buf, k_pe_buf = self.kv_buffer[layer_id]
+                    k_nope_buf[chunk_indices] = k_nope_cpu.to(k_nope_buf.device, non_blocking=True)
+                    k_pe_buf[chunk_indices] = k_pe_cpu.to(k_pe_buf.device, non_blocking=True)
         self.device_module.synchronize()
