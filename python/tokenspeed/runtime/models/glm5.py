@@ -38,6 +38,7 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 logger = get_colorful_logger(__name__)
 
 ACL_FORMAT_FRACTAL_NZ = 29
+ACL_FORMAT_FRACTAL_ND = 2
 
 def _load_ascend_custom_ops():
     """Load _C_ascend custom ops for int8×int8 quantized grouped matmul.
@@ -460,31 +461,27 @@ class GlmMoeDsaAttention(nn.Module):
             self._q_b_offset_expanded = self.q_b_proj.input_offset.data.to(torch.int32).expand(q_lora).contiguous()
 
     def _dequant_o_proj(self):
-        """Dequantize o_proj weight to bf16 for matmul_allreduce_add_rmsnorm fusion.
+        """Prepare o_proj params for npu_mm_all_reduce_base antiquant fusion.
 
-        Note: weight is stored as [in, out] after process_weights_after_loading
-        (transposed from checkpoint [out, in] and converted to NZ).
-        deq_scale is [out] (not transposed).
+        antiquant_scale = deq_scale / input_scale (per-channel, bf16).
+        input_offset folded into x: x_adj = x + input_offset * input_scale.
+        quant_bias used as bias (rank 0 only, added once before all_reduce).
         """
         if self._o_proj_dequant_done:
             return
         with torch.no_grad():
-            # weight is [in, out] = [1024, 6144] after transpose in process_weights
-            w_t = self.o_proj.weight.data.float()  # [in, out]
-            ds = self.o_proj.deq_scale.data.float()  # [out]
-            s = self.o_proj.input_scale.data.float()  # [1]
-            # Dequantize: w_dequant[in, out] = w_t * ds.unsqueeze(0) / s
-            w_dequant_t = w_t * ds.unsqueeze(0) / s  # [in, out]
-            # Transpose to [out, in] for matmul_allreduce_add_rmsnorm (isTransB=True)
-            self._o_proj_weight_bf16 = w_dequant_t.t().contiguous().to(torch.bfloat16)
-            # Fold bias: quant_bias (rank 0 only) + input_offset term
-            offset = self.o_proj.input_offset.data.float()
-            bias = torch.zeros_like(ds)
+            ds = self.o_proj.deq_scale.data.float()
+            s = self.o_proj.input_scale.data.float()
+            self._o_proj_antiquant_scale = (ds / s).to(torch.bfloat16).contiguous()
+            self._o_proj_input_adjust = (
+                self.o_proj.input_offset.data.float() * s
+            ).to(torch.bfloat16).item()
+            # npu_mm_all_reduce_base adds bias BEFORE all_reduce (per-NPU),
+            # so quant_bias only on rank 0 (added once after all_reduce sum).
             if self.o_proj.tp_rank == 0:
-                bias = bias + self.o_proj.quant_bias.data.float()
-            # offset * sum over input dim of (w_t * ds) / s
-            bias = bias + offset * (w_t * ds.unsqueeze(0)).sum(dim=0) / s
-            self._o_proj_bias_bf16 = bias.to(torch.bfloat16).contiguous()
+                self._o_proj_quant_bias_or_none = self.o_proj.quant_bias.data
+            else:
+                self._o_proj_quant_bias_or_none = None
         self._o_proj_dequant_done = True
 
     def _init_tp_group_name(self):
