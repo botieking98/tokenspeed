@@ -85,7 +85,9 @@ def trans_rope_weight(weight, rope_dim):
 class NPURotaryEmbedding:
     """Interleaved RoPE for GLM-5.1 (GPT-J style, is_neox_style=False).
 
-    Uses pure PyTorch implementation for correctness on NPU.
+    Uses npu_interleave_rope fused kernel (1 op vs 6+ manual ops).
+    Output is in split-half layout; attention dot product is layout-
+    invariant so both Q and K can use split-half format.
     """
 
     def __init__(self, head_size: int, base: float, max_position: int):
@@ -102,45 +104,39 @@ class NPURotaryEmbedding:
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.head_size, 2, dtype=torch.float32, device=device) / self.head_size))
         t = torch.arange(self.max_position, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)  # [max_pos, head_size/2]
-        self._cos_cache = freqs.cos().to(dtype)
-        self._sin_cache = freqs.sin().to(dtype)
+        cos_half = freqs.cos().to(dtype)
+        sin_half = freqs.sin().to(dtype)
+        self._cos_cache = cos_half.repeat(1, 2)  # [max_pos, D] concatenated
+        self._sin_cache = sin_half.repeat(1, 2)
+
+    def _apply_rope_op(self, x, cos, sin):
+        """Apply npu_interleave_rope to x [N, ..., D].
+        cos/sin: [N, D] (concatenated doubled format).
+        Returns [N, ..., D] in split-half layout.
+        """
+        orig_shape = x.shape
+        D = self.head_size
+        if x.dim() == 3:
+            N, H, _ = x.shape
+            x_4d = x.unsqueeze(2)  # [N, H, 1, D]
+        else:
+            N = x.shape[0]
+            x_4d = x.unsqueeze(1).unsqueeze(1)  # [N, 1, 1, D]
+        cos_4d = cos.unsqueeze(1).unsqueeze(1)  # [N, 1, 1, D] (broadcast)
+        sin_4d = sin.unsqueeze(1).unsqueeze(1)
+        out = torch_npu.npu_interleave_rope(x_4d, cos_4d, sin_4d)
+        return out.reshape(orig_shape)
 
     def __call__(self, positions, q, k):
-        """Apply interleaved (GPT-J style) RoPE to q and k.
-        q: [N, H, D], k: [N, H, D] or [N, D]
-        Returns: (q_rotated, k_rotated)
+        """Apply interleaved RoPE to q and k.
+        q: [N, H, D], k: [N, D] or [N, H, D]
+        Returns: (q_rotated, k_rotated) in split-half layout.
         """
         self._ensure_cache(q.device, q.dtype)
-        cos = self._cos_cache[positions]  # [N, D/2]
+        cos = self._cos_cache[positions]
         sin = self._sin_cache[positions]
-
-        cos_h = cos.unsqueeze(1)  # [N, 1, D/2]
-        sin_h = sin.unsqueeze(1)
-
-        # Interleaved RoPE (is_neox_style=False):
-        # x1 = x[..., ::2], x2 = x[..., 1::2]
-        # o1 = x1 * cos - x2 * sin
-        # o2 = x2 * cos + x1 * sin
-        # output = interleave(o1, o2)
-        def apply_rope(x, cos_h, sin_h):
-            x1 = x[..., ::2]
-            x2 = x[..., 1::2]
-            o1 = x1 * cos_h - x2 * sin_h
-            o2 = x2 * cos_h + x1 * sin_h
-            return torch.stack((o1, o2), dim=-1).flatten(-2)
-
-        q_out = apply_rope(q, cos_h, sin_h)
-
-        if k.dim() == 2:
-            cos_k = cos.unsqueeze(1)  # [N, 1, D/2] -- but k is [N, D], need [N, 1, D/2]
-            sin_k = sin.unsqueeze(1)
-            k1 = k[..., ::2]
-            k2 = k[..., 1::2]
-            o1 = k1 * cos - k2 * sin
-            o2 = k2 * cos + k1 * sin
-            k_out = torch.stack((o1, o2), dim=-1).flatten(-2)
-        else:
-            k_out = apply_rope(k, cos_h, sin_h)
+        q_out = self._apply_rope_op(q, cos, sin)
+        k_out = self._apply_rope_op(k, cos, sin)
         return q_out, k_out
 
     def apply_q(self, positions, q):
@@ -148,13 +144,7 @@ class NPURotaryEmbedding:
         self._ensure_cache(q.device, q.dtype)
         cos = self._cos_cache[positions]
         sin = self._sin_cache[positions]
-        cos_h = cos.unsqueeze(1)
-        sin_h = sin.unsqueeze(1)
-        x1 = q[..., ::2]
-        x2 = q[..., 1::2]
-        o1 = x1 * cos_h - x2 * sin_h
-        o2 = x2 * cos_h + x1 * sin_h
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
+        return self._apply_rope_op(q, cos, sin)
 
 
 # ---------------------------------------------------------------------------
