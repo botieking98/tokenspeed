@@ -265,13 +265,17 @@ class NPUMlaAttnBackend(AttentionBackend):
         seq_lens = metadata.seq_lens
         num_tokens = q_decode.shape[0]
 
-        # Q is [N, H, kv_lora + rope] (absorbed from model)
-        q_nope = q_decode[..., : self.kv_lora_rank]
-        q_pe = q_decode[..., self.kv_lora_rank :]
-
-        # Reshape to BNSD: [N, H, 1, D]
-        q_nope = q_nope.reshape(num_tokens, self.num_local_heads, 1, self.kv_lora_rank).contiguous()
-        q_pe = q_pe.reshape(num_tokens, self.num_local_heads, 1, self.qk_rope_head_dim)
+        # Q is [N, H, kv_lora] (q_absorbed) with q_pe passed separately
+        q_pe_split = kwargs.get("q_pe_split", None)
+        if q_pe_split is not None:
+            q_nope = q_decode.reshape(num_tokens, self.num_local_heads, 1, self.kv_lora_rank)
+            q_pe = q_pe_split.reshape(num_tokens, self.num_local_heads, 1, self.qk_rope_head_dim)
+        else:
+            # Fallback: Q is [N, H, kv_lora + rope] (legacy combined format)
+            q_nope = q_decode[..., : self.kv_lora_rank]
+            q_pe = q_decode[..., self.kv_lora_rank :]
+            q_nope = q_nope.reshape(num_tokens, self.num_local_heads, 1, self.kv_lora_rank).contiguous()
+            q_pe = q_pe.reshape(num_tokens, self.num_local_heads, 1, self.qk_rope_head_dim)
 
         # KV cache: separate k_nope and k_pe buffers (already contiguous)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)

@@ -508,12 +508,11 @@ class GlmMoeDsaAttention(nn.Module):
         q = self.q_b_proj(q_norm)
         q = q.view(num_tokens, self.num_local_heads, self.qk_head_dim)
 
-        attn_output = torch.empty(
-            num_tokens, self.num_local_heads * self.v_head_dim,
-            dtype=orig_dtype, device=hidden_states.device,
-        )
-
-        if num_prefill_tokens > 0:
+        if num_prefill_tokens > 0 and num_decode_tokens > 0:
+            attn_output = torch.empty(
+                num_tokens, self.num_local_heads * self.v_head_dim,
+                dtype=orig_dtype, device=hidden_states.device,
+            )
             prefill_out = self._forward_prefill(
                 positions[:num_prefill_tokens],
                 q[:num_prefill_tokens],
@@ -522,8 +521,6 @@ class GlmMoeDsaAttention(nn.Module):
                 out_cache_loc[:num_prefill_tokens],
             )
             attn_output[:num_prefill_tokens] = prefill_out
-
-        if num_decode_tokens > 0:
             decode_out = self._forward_decode(
                 positions[num_prefill_tokens:],
                 q[num_prefill_tokens:],
@@ -532,6 +529,16 @@ class GlmMoeDsaAttention(nn.Module):
                 out_cache_loc[num_prefill_tokens:],
             )
             attn_output[num_prefill_tokens:] = decode_out
+        elif num_decode_tokens > 0:
+            attn_output = self._forward_decode(
+                positions, q, latent_cache,
+                ctx, out_cache_loc,
+            )
+        else:
+            attn_output = self._forward_prefill(
+                positions, q, latent_cache,
+                ctx, out_cache_loc,
+            )
 
         if self.o_proj.tp_size > 1:
             output = self.o_proj(attn_output)
@@ -600,11 +607,6 @@ class GlmMoeDsaAttention(nn.Module):
         )
         q_pe_rotated, k_pe_rotated = self.rotary_emb(positions, q_pe, k_pe)
 
-        kv_lora = self.kv_lora_rank
-        rope_dim = self.qk_rope_head_dim
-        Q = torch.cat([q_absorbed, q_pe_rotated], dim=-1)
-        K = torch.cat([kv_a_norm, k_pe_rotated], dim=-1)
-
         # Write KV cache (ROTATED k_pe)
         ctx.token_to_kv_pool.set_mla_kv_buffer(
             self.attn_mqa, out_cache_loc,
@@ -613,10 +615,13 @@ class GlmMoeDsaAttention(nn.Module):
         )
 
         # Run attention via backend (absorbed path)
+        # Pass q_absorbed [N, H, kv_lora] and q_pe_rotated [N, H, rope]
+        # separately to avoid cat+slice+contiguous round-trip.
         self.attn_mqa.kv_b_proj = self.kv_b_proj
         output = self.attn_mqa(
-            Q, K.unsqueeze(1), kv_a_norm.unsqueeze(1),
+            q_absorbed, None, None,
             ctx, out_cache_loc, save_kv_cache=False,
+            q_pe_split=q_pe_rotated,
         )
         return output
 
