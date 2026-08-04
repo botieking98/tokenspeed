@@ -33,6 +33,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.utils import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
+
+try:
+    import torch_npu
+    _ACL_FORMAT_FRACTAL_NZ = 3
+    _HAS_NPU = True
+except ImportError:
+    _HAS_NPU = False
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -106,23 +113,23 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                     for _ in range(layer_num)
                 ]
             else:
-                # Store k_nope and k_pe as separate contiguous buffers to
-                # avoid .contiguous() copies in attention decode path.
-                self.kv_buffer = [
-                    (
-                        torch.zeros(
-                            (self.size + self.page_size, 1, self.kv_lora_rank),
-                            dtype=self.store_dtype,
-                            device=device,
-                        ),
-                        torch.zeros(
-                            (self.size + self.page_size, 1, self.qk_rope_head_dim),
-                            dtype=self.store_dtype,
-                            device=device,
-                        ),
+                # Store k_nope and k_pe as separate buffers in NZ (Fractal)
+                # format for efficient attention kernel reads on NPU.
+                # ND indexed writes still work on NZ buffers (auto-converted).
+                self.kv_buffer = []
+                for _ in range(layer_num):
+                    k_nope = torch.zeros(
+                        (self.size + self.page_size, 1, self.kv_lora_rank),
+                        dtype=self.store_dtype, device=device,
                     )
-                    for _ in range(layer_num)
-                ]
+                    k_pe = torch.zeros(
+                        (self.size + self.page_size, 1, self.qk_rope_head_dim),
+                        dtype=self.store_dtype, device=device,
+                    )
+                    if _HAS_NPU and self.store_dtype in (torch.bfloat16, torch.float16):
+                        k_nope = torch_npu.npu_format_cast(k_nope, _ACL_FORMAT_FRACTAL_NZ)
+                        k_pe = torch_npu.npu_format_cast(k_pe, _ACL_FORMAT_FRACTAL_NZ)
+                    self.kv_buffer.append((k_nope, k_pe))
 
         # Calculate data pointers and strides for all buffers
         all_buffers = []
