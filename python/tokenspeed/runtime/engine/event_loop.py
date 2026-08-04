@@ -760,6 +760,8 @@ class EventLoop:
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.memory_executor is None:
             return
+        if not self.server_args.enable_kvstore:
+            return
         forward_op = self._get_forward_op(execution_plan)
         mamba_layerwise_cow = self._build_mamba_layerwise_cow(
             execution_plan, forward_op

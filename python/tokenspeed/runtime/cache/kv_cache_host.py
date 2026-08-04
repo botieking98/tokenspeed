@@ -64,6 +64,12 @@ if _platform.is_amd:
         transfer_kv_per_layer_mla,
     )
 
+if _platform.is_ascend:
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        transfer_kv_all_layer_mla,
+        transfer_kv_per_layer_mla,
+    )
+
 MLA_KVSTORE_LOADBACK_BLOCK_QUOTA = 16
 MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA = 16
 
