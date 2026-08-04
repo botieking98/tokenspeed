@@ -1116,9 +1116,9 @@ class GlmMoeDsaMoE(nn.Module):
 
         self._prepare_grouped_weights()
 
-        # Mask topk_weights for non-local experts (pre-cast to bf16 for unpermute)
+        # Mask topk_weights for non-local experts via where (4 kernels vs 5)
         local_mask = (topk_ids >= first_expert) & (topk_ids < first_expert + E)
-        topk_weights_masked = topk_weights * local_mask.to(topk_weights.dtype)
+        topk_weights_masked = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
 
         # Token dispatch with fused dynamic quant (quant_mode=1):
         # bf16 → int8 expanded_x + per-token scale in one kernel
@@ -1193,9 +1193,9 @@ class GlmMoeDsaMoE(nn.Module):
 
         self._prepare_grouped_weights()
 
-        # Mask topk_weights for non-local experts (zero contribution)
+        # Mask topk_weights for non-local experts via where (4 kernels vs 5)
         local_mask = (topk_ids >= first_expert) & (topk_ids < first_expert + E)
-        topk_weights_masked = topk_weights * local_mask.to(topk_weights.dtype)
+        topk_weights_masked = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
 
         # Token dispatch: sort tokens by local expert
         expanded_x, expanded_row_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
