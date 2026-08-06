@@ -265,7 +265,21 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = mla_config.kv_lora_rank
             self.qk_nope_head_dim = mla_config.qk_nope_head_dim
-            self.qk_rope_head_dim = mla_config.qk_rope_head_dim
+            # Fix: transformers' GlmMoeDsaConfig maps "head_dim" ->
+            # "qk_rope_head_dim", so config.json's head_dim (192) overwrites
+            # qk_rope_head_dim (64). Recover from qk_head_dim if available.
+            qk_rope = mla_config.qk_rope_head_dim
+            if hasattr(mla_config, "qk_head_dim"):
+                correct_rope = mla_config.qk_head_dim - mla_config.qk_nope_head_dim
+                if qk_rope != correct_rope:
+                    logger.warning(
+                        "Fixing qk_rope_head_dim: %d -> %d (head_dim attribute_map bug)",
+                        qk_rope, correct_rope)
+                    qk_rope = correct_rope
+                    # Also fix the underlying hf_config so model code that
+                    # reads config.qk_rope_head_dim gets the correct value.
+                    mla_config.qk_rope_head_dim = correct_rope
+            self.qk_rope_head_dim = qk_rope
             self.v_head_dim = mla_config.v_head_dim
 
             # Handle rope scaling with yarn
