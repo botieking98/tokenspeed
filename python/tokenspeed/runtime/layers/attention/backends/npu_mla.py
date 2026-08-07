@@ -430,14 +430,13 @@ class NPUMlaAttnBackend(AttentionBackend):
                 torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device),
                 diagonal=1,
             )
-            out, _ = torch_npu.npu_fused_infer_attention_score(
+            out = torch_npu.npu_fusion_attention(
                 qi, ki, vi,
-                num_heads=self.num_local_heads,
+                self.num_local_heads,
                 input_layout="BNSD",
                 scale=self.scaling,
                 atten_mask=causal_mask,
-                num_key_value_heads=self.num_local_heads,
-            )
+            )[0]
             outputs.append(out.squeeze(0).transpose(0, 1))  # [seq, H, D]
             offset += seq_len
 
