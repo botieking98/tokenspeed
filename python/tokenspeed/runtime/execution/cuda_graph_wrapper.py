@@ -335,6 +335,24 @@ class CudaGraphWrapper:
                 self.graphs[bs] = graph
                 self.output_buffers[bs] = output_buffers
 
+            # Release warmup activation memory trapped in the NPU caching
+            # allocator after all graphs are captured.  Without this the
+            # temporary tensors allocated during the 4× warmup forwards
+            # remain reserved, leaving insufficient free memory for eager
+            # prefill of large chunks (e.g. chunked_prefill_size=4096).
+            if self.device == "npu":
+                _dm.synchronize()
+                dist.barrier()
+                try:
+                    torch.npu.empty_cache()
+                except Exception:
+                    pass
+                if rank == 0:
+                    avail = get_available_gpu_memory(
+                        self.device, self.gpu_id, empty_cache=False)
+                    logger.info(
+                        "Post-capture empty_cache: avail_mem=%.2f GB", avail)
+
     def _capture_one(self, bs: int):
         if self.device == "npu":
             graph = torch.npu.NPUGraph()
