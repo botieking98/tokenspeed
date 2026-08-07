@@ -259,27 +259,39 @@ class FusedGateUpMLP(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.register_parameter("gate_up_weight", None)
-        self.register_parameter("gate_up_scale", None)
-        self.register_parameter("gate_up_offset", None)
-        self.register_parameter("down_weight", None)
-        self.register_parameter("down_scale", None)
-        self.register_parameter("down_offset", None)
+        self.gate_up_weight = nn.Parameter(
+            torch.empty(hidden_size, 2 * intermediate_size, dtype=torch.int8),
+            requires_grad=False,
+        )
+        self.gate_up_scale = nn.Parameter(
+            torch.empty(2 * intermediate_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.gate_up_offset = nn.Parameter(
+            torch.empty(2 * intermediate_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.down_weight = nn.Parameter(
+            torch.empty(intermediate_size, hidden_size, dtype=torch.int8),
+            requires_grad=False,
+        )
+        self.down_scale = nn.Parameter(
+            torch.empty(hidden_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.down_offset = nn.Parameter(
+            torch.empty(hidden_size, dtype=torch.float32),
+            requires_grad=False,
+        )
 
     def load_from_linears(self, gate, up, down):
         with torch.no_grad():
-            self.gate_up_weight = nn.Parameter(
-                torch.cat([gate.weight.data, up.weight.data], dim=1),
-                requires_grad=False)
-            self.gate_up_scale = nn.Parameter(
-                torch.cat([gate.weight_scale.data, up.weight_scale.data]),
-                requires_grad=False)
-            self.gate_up_offset = nn.Parameter(
-                torch.cat([gate.weight_offset.data, up.weight_offset.data]),
-                requires_grad=False)
-            self.down_weight = nn.Parameter(down.weight.data, requires_grad=False)
-            self.down_scale = nn.Parameter(down.weight_scale.data, requires_grad=False)
-            self.down_offset = nn.Parameter(down.weight_offset.data, requires_grad=False)
+            self.gate_up_weight.data = torch.cat([gate.weight.data, up.weight.data], dim=1)
+            self.gate_up_scale.data = torch.cat([gate.weight_scale.data, up.weight_scale.data])
+            self.gate_up_offset.data = torch.cat([gate.weight_offset.data, up.weight_offset.data])
+            self.down_weight.data = down.weight.data
+            self.down_scale.data = down.weight_scale.data
+            self.down_offset.data = down.weight_offset.data
 
     def forward(self, x):
         quant_x, pertoken_scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
@@ -431,20 +443,6 @@ class GlmMoeDsaAttention(nn.Module):
             hidden_size = self.q_a_proj.in_features
             self._qkv_a_quant_scale_f32 = self._qkv_a_input_scale.expand(hidden_size).contiguous()
             self._qkv_a_quant_offset_i32 = self._qkv_a_input_offset.to(torch.int32).expand(hidden_size).contiguous()
-
-            # Free original weights and scales (now fused into _qkv_a_* tensors).
-            # input_scale/input_offset are tiny scalars, keep references.
-            device = self._qkv_a_weight.device
-            for proj in [self.q_a_proj, self.kv_a_proj_with_mqa]:
-                proj.weight = nn.Parameter(
-                    torch.empty(1, dtype=torch.int8, device=device),
-                    requires_grad=False)
-                proj.deq_scale = nn.Parameter(
-                    torch.empty(1, dtype=torch.float32, device=device),
-                    requires_grad=False)
-                proj.quant_bias = nn.Parameter(
-                    torch.empty(1, dtype=torch.int32, device=device),
-                    requires_grad=False)
         self._qkv_a_fused = True
 
     def _maybe_prepare_q_b_quant(self):
@@ -811,18 +809,25 @@ class GlmMoeDsaMoE(nn.Module):
             return
 
         E = self.num_local_experts
-        device = self.experts[0].gate_proj.weight.device
 
-        in_f = self.experts[0].gate_proj.weight.shape[0]
-        out_f = self.experts[0].gate_proj.weight.shape[1]
-        inter_f = self.experts[0].down_proj.weight.shape[0]
+        def stack_nd(experts, proj_name):
+            """Convert NZ int8 weights to ND and stack: [E, in, out] int8 ND."""
+            weights = []
+            for e in experts:
+                w = getattr(e, proj_name)
+                w_nd = torch.empty(w.weight.shape, dtype=w.weight.dtype, device=w.weight.device)
+                w_nd.copy_(w.weight)  # NZ -> ND copy
+                weights.append(w_nd)
+            return torch.stack(weights, dim=0).contiguous()
 
-        nd_w13 = torch.empty(E, in_f, 2 * out_f, dtype=torch.int8, device=device)
-        nd_w2 = torch.empty(E, inter_f, in_f, dtype=torch.int8, device=device)
-        for i, e in enumerate(self.experts):
-            nd_w13[i, :, :out_f].copy_(e.gate_proj.weight.data)
-            nd_w13[i, :, out_f:].copy_(e.up_proj.weight.data)
-            nd_w2[i].copy_(e.down_proj.weight.data)
+        gate_weight = stack_nd(self.experts, "gate_proj")  # [E, in, out]
+        up_weight = stack_nd(self.experts, "up_proj")      # [E, in, out]
+        down_weight = stack_nd(self.experts, "down_proj")   # [E, inter, hidden]
+
+        # Fuse gate + up: [E, in, 2*inter] ND, then convert to NZ format
+        nd_w13 = torch.cat([gate_weight, up_weight], dim=2).contiguous()
+        del gate_weight, up_weight
+        nd_w2 = down_weight
 
         # Convert to NZ format (saves memory: only one copy, used for both
         # quant gmm and antiquant paths, matching vllm-ascend approach)
@@ -851,6 +856,7 @@ class GlmMoeDsaMoE(nn.Module):
 
         # Free individual expert weights to reclaim memory
         import gc
+        device = self._grouped_w13_weight.device
         for e in self.experts:
             for proj in [e.gate_proj, e.up_proj, e.down_proj]:
                 proj.weight = nn.Parameter(
@@ -1487,26 +1493,6 @@ class GlmMoeDsaForCausalLM(BaseCausalLM):
 
     def __init__(self, config, mapping, quant_config=None, prefix=""):
         super().__init__(config, mapping, quant_config, prefix)
-
-    def post_quant_warmup(self):
-        """Eagerly prepare fused/grouped weights after loading.
-
-        Runs _maybe_fuse_qkv_a (attention), _maybe_fuse (shared experts),
-        and _prepare_grouped_weights (MoE experts) for all layers before
-        graph capture, so freed memory is available for graph/activation.
-        """
-        import gc
-        for layer in self.model.layers:
-            layer.self_attn._maybe_fuse_qkv_a()
-            if isinstance(layer.mlp, GlmMoeDsaMLP):
-                layer.mlp._maybe_fuse()
-            elif hasattr(layer.mlp, "_prepare_grouped_weights"):
-                layer.mlp._prepare_grouped_weights()
-        gc.collect()
-        try:
-            torch.npu.empty_cache()
-        except Exception:
-            pass
 
     def get_skip_weight_names(self):
         return ["rotary_emb.inv_freq", "indexer"]
