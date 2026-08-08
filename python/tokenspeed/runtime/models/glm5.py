@@ -164,6 +164,20 @@ class NPURotaryEmbedding:
         sin = self._sin_cache[positions]
         return self._apply_rope_op(q, cos, sin)
 
+    def get_cos_sin(self, positions, device, dtype):
+        """Get indexed cos/sin using shared cache (avoids re-indexing per layer)."""
+        self._ensure_cache(device, dtype)
+        ptr = positions.data_ptr()
+        n = positions.shape[0]
+        if (NPURotaryEmbedding._shared_positions_ptr != ptr
+                or NPURotaryEmbedding._shared_cos is None
+                or NPURotaryEmbedding._shared_cos.shape[0] != n
+                or NPURotaryEmbedding._shared_cos.device != device):
+            NPURotaryEmbedding._shared_cos = self._cos_cache[positions]
+            NPURotaryEmbedding._shared_sin = self._sin_cache[positions]
+            NPURotaryEmbedding._shared_positions_ptr = ptr
+        return NPURotaryEmbedding._shared_cos, NPURotaryEmbedding._shared_sin
+
 
 # ---------------------------------------------------------------------------
 # W8A8 quantized layers

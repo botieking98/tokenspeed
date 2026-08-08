@@ -113,9 +113,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                     for _ in range(layer_num)
                 ]
             else:
-                # Store k_nope and k_pe as separate buffers in NZ (Fractal)
-                # format for efficient attention kernel reads on NPU.
-                # ND indexed writes still work on NZ buffers (auto-converted).
+                # Store k_nope and k_pe as separate ND-format buffers.
+                # ND format is required for npu_kv_rmsnorm_rope_cache (PA mode)
+                # and matches vllm-ascend default (enable_kv_nz=False).
                 self.kv_buffer = []
                 for _ in range(layer_num):
                     k_nope = torch.zeros(
@@ -126,9 +126,6 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                         (self.size + self.page_size, 1, self.qk_rope_head_dim),
                         dtype=self.store_dtype, device=device,
                     )
-                    if _HAS_NPU and self.store_dtype in (torch.bfloat16, torch.float16):
-                        k_nope = torch_npu.npu_format_cast(k_nope, _ACL_FORMAT_FRACTAL_NZ)
-                        k_pe = torch_npu.npu_format_cast(k_pe, _ACL_FORMAT_FRACTAL_NZ)
                     self.kv_buffer.append((k_nope, k_pe))
 
         # Calculate data pointers and strides for all buffers
