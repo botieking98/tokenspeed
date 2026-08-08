@@ -663,20 +663,46 @@ class GlmMoeDsaAttention(nn.Module):
         q_absorbed = torch_npu.npu_transpose_batchmatmul(
             q_nope, self._w_kc, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
 
-        # Apply RMSNorm to kv_a
-        kv_a = latent_cache[..., :self.kv_lora_rank]
-        k_pe = latent_cache[..., self.kv_lora_rank:]
-        kv_a_norm, _ = torch_npu.npu_rms_norm(
-            kv_a, self.kv_a_layernorm.weight,
-            epsilon=self.kv_a_layernorm.variance_epsilon,
-        )
-        q_pe_rotated, k_pe_rotated = self.rotary_emb(positions, q_pe, k_pe)
+        # Fused KV decode: RMSNorm + RoPE via npu_kv_rmsnorm_rope_cache,
+        # writing to a small dummy buffer. Per-token outputs (r3, r4) are
+        # then written to the real KV cache via set_mla_kv_buffer (graph-safe).
+        # This saves 1 graph pool allocation/layer vs the original 3-op path
+        # (npu_rms_norm + npu_interleave_rope + set_mla_kv_buffer).
+        cos, sin = self.rotary_emb.get_cos_sin(
+            positions, q_pe.device, q_pe.dtype)
+        q_pe_rotated = self.rotary_emb._apply_rope_op(q_pe, cos, sin)
 
-        # Write KV cache (ROTATED k_pe)
+        num_tokens = q_pe.shape[0]
+        if not hasattr(self, "_dummy_k_pe") or self._dummy_k_pe.shape[2] < num_tokens:
+            self._dummy_k_pe = torch.zeros(
+                1, 1, num_tokens, self.qk_rope_head_dim,
+                dtype=q_pe.dtype, device=q_pe.device)
+            self._dummy_ckv = torch.zeros(
+                1, 1, num_tokens, self.kv_lora_rank,
+                dtype=q_pe.dtype, device=q_pe.device)
+            self._dummy_slots = torch.arange(
+                num_tokens, dtype=torch.int64, device=q_pe.device)
+
+        kv_no_split = latent_cache.reshape(
+            -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim)
+        cos_4d = cos.unsqueeze(1).unsqueeze(1)
+        sin_4d = sin.unsqueeze(1).unsqueeze(1)
+
+        _, _, k_pe_out, k_nope_out = torch_npu.npu_kv_rmsnorm_rope_cache(
+            kv_no_split,
+            self.kv_a_layernorm.weight,
+            cos_4d, sin_4d,
+            self._dummy_slots[:num_tokens],
+            self._dummy_k_pe, self._dummy_ckv,
+            epsilon=self.kv_a_layernorm.variance_epsilon,
+            cache_mode="PA",
+            is_output_kv=True,
+        )
+
         ctx.token_to_kv_pool.set_mla_kv_buffer(
             self.attn_mqa, out_cache_loc,
-            cache_k_nope=kv_a_norm,
-            cache_k_rope=k_pe_rotated,
+            cache_k_nope=k_nope_out.view(-1, self.kv_lora_rank),
+            cache_k_rope=k_pe_out.view(-1, self.qk_rope_head_dim),
         )
 
         # Run attention via backend (absorbed path)
