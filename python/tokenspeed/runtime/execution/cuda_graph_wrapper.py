@@ -476,7 +476,7 @@ class CudaGraphWrapper:
         if self.device == "npu":
             self._dm.current_stream().synchronize()
             with self._dm.stream(self.stream):
-                graph.capture_begin()
+                graph.capture_begin(pool=global_graph_memory_pool)
                 out = run_once()
                 graph.capture_end()
         else:

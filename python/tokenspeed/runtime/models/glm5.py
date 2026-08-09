@@ -214,10 +214,11 @@ class W8A8StaticLinear(nn.Module):
         self.weight.data = self.weight.data.transpose(0, 1).contiguous()
         self.weight.data = _maybe_trans_nz(self.weight.data)
         self.deq_scale.data = self.deq_scale.data.to(torch.float32).contiguous()
+        self._input_offset_int8 = self.input_offset.data.to(torch.int8)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         quant_x = torch_npu.npu_quantize(
-            x, self.input_scale.data, self.input_offset.data.to(torch.int8),
+            x, self.input_scale.data, self._input_offset_int8,
             torch.qint8, axis=1, div_mode=True,
         )
         bias = self.quant_bias
@@ -552,13 +553,22 @@ class GlmMoeDsaAttention(nn.Module):
         # Fuse q_a RMSNorm + q_b_proj quantize via npu_add_rms_norm_quant
         # (x2=zeros → add 0 is identity), saving 1 kernel per layer.
         self._maybe_prepare_q_b_quant()
-        if not hasattr(self, "_q_a_zeros") or self._q_a_zeros.shape[0] < num_tokens:
+        # Fixed-size buffer for graph capture (decode bs <= 128).
+        # Prefill (num_tokens > 128) runs in eager mode and uses a fresh
+        # tensor, so it never invalidates the captured graph's address.
+        if not hasattr(self, "_q_a_zeros"):
             self._q_a_zeros = torch.zeros(
-                num_tokens, self.q_lora_rank,
+                128, self.q_lora_rank,
                 dtype=torch.bfloat16, device=q_a.device,
             )
+        if num_tokens <= 128:
+            q_a_zeros = self._q_a_zeros[:num_tokens]
+        else:
+            q_a_zeros = torch.zeros(
+                num_tokens, self.q_lora_rank,
+                dtype=torch.bfloat16, device=q_a.device)
         q_quant, _, _ = torch_npu.npu_add_rms_norm_quant(
-            q_a, self._q_a_zeros[:num_tokens],
+            q_a, q_a_zeros,
             self.q_a_layernorm.weight.data,
             self._q_b_scale_expanded, self._q_b_offset_expanded,
             None, epsilon=self.q_a_layernorm.variance_epsilon,
@@ -673,15 +683,19 @@ class GlmMoeDsaAttention(nn.Module):
         q_pe_rotated = self.rotary_emb._apply_rope_op(q_pe, cos, sin)
 
         num_tokens = q_pe.shape[0]
-        if not hasattr(self, "_dummy_k_pe") or self._dummy_k_pe.shape[2] < num_tokens:
+        # Allocate at fixed max size (128) so buffer addresses stay stable
+        # across multi-graph capture. Reallocation during a later capture
+        # would invalidate addresses recorded by earlier captured graphs.
+        _dummy_max = 128
+        if not hasattr(self, "_dummy_k_pe"):
             self._dummy_k_pe = torch.zeros(
-                1, 1, num_tokens, self.qk_rope_head_dim,
+                1, 1, _dummy_max, self.qk_rope_head_dim,
                 dtype=q_pe.dtype, device=q_pe.device)
             self._dummy_ckv = torch.zeros(
-                1, 1, num_tokens, self.kv_lora_rank,
+                1, 1, _dummy_max, self.kv_lora_rank,
                 dtype=q_pe.dtype, device=q_pe.device)
             self._dummy_slots = torch.arange(
-                num_tokens, dtype=torch.int64, device=q_pe.device)
+                _dummy_max, dtype=torch.int64, device=q_pe.device)
 
         kv_no_split = latent_cache.reshape(
             -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim)
@@ -1172,7 +1186,7 @@ class GlmMoeDsaMoE(nn.Module):
 
         # Mask topk_weights for non-local experts via where (4 kernels vs 5)
         local_mask = (topk_ids >= first_expert) & (topk_ids < first_expert + E)
-        topk_weights_masked = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
+        topk_weights_masked = topk_weights * local_mask.to(topk_weights.dtype)
 
         # Token dispatch with fused dynamic quant (quant_mode=1):
         # bf16 → int8 expanded_x + per-token scale in one kernel
@@ -1249,7 +1263,7 @@ class GlmMoeDsaMoE(nn.Module):
 
         # Mask topk_weights for non-local experts via where (4 kernels vs 5)
         local_mask = (topk_ids >= first_expert) & (topk_ids < first_expert + E)
-        topk_weights_masked = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
+        topk_weights_masked = topk_weights * local_mask.to(topk_weights.dtype)
 
         # Token dispatch: sort tokens by local expert
         expanded_x, expanded_row_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(

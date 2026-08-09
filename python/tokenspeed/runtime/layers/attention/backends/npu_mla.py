@@ -92,8 +92,8 @@ class NPUMlaAttnBackend(AttentionBackend):
         self.cuda_graph_page_table: torch.Tensor | None = None
         self.cuda_graph_seq_lens: torch.Tensor | None = None
         self._decode_workspace: torch.Tensor | None = None
-        self._decode_attn_output: torch.Tensor | None = None
-        self._decode_softmax_lse: torch.Tensor | None = None
+        self._decode_attn_outputs: dict[int, torch.Tensor] = {}
+        self._decode_softmax_lses: dict[int, torch.Tensor] = {}
         self._graph_handles: dict[int, list] = {}
         self._graph_events: dict[int, list] = {}
         self._npu_update_stream = None
@@ -311,16 +311,16 @@ class NPUMlaAttnBackend(AttentionBackend):
         # Pre-allocate workspace and output as instance attributes so they
         # persist across graph capture/replay (torch.empty inside capture
         # does not allocate from the graph pool on NPU).
-        if self._decode_attn_output is None or self._decode_attn_output.shape[1] != num_tokens:
-            self._decode_attn_output = torch.empty(
+        if num_tokens not in self._decode_attn_outputs:
+            self._decode_attn_outputs[num_tokens] = torch.empty(
                 self.num_local_heads, num_tokens, 1, self.kv_lora_rank,
                 dtype=q_nope.dtype, device=q_nope.device,
             )
-            self._decode_softmax_lse = torch.empty(
+            self._decode_softmax_lses[num_tokens] = torch.empty(
                 num_tokens, dtype=q_nope.dtype, device=q_nope.device,
             )
-        attn_output = self._decode_attn_output
-        softmax_lse = self._decode_softmax_lse
+        attn_output = self._decode_attn_outputs[num_tokens]
+        softmax_lse = self._decode_softmax_lses[num_tokens]
         common_kwargs = dict(
             query_rope=q_pe,
             key_rope=k_pe,
