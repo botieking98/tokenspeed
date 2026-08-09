@@ -162,7 +162,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile
+@torch.compile(dynamic=True, backend="eager")
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,

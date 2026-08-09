@@ -724,9 +724,15 @@ class GlmMoeDsaAttention(nn.Module):
 class GlmMoeDsaMLP(nn.Module):
     """Dense SwiGLU MLP with W8A8 weights, fused gate+up."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int, mapping: Mapping, prefix: str = ""):
+    def __init__(self, hidden_size: int, intermediate_size: int, mapping: Mapping, prefix: str = "",
+                 tp_shard: bool = False):
         super().__init__()
         self.mapping = mapping
+        self.tp_shard = tp_shard
+        if tp_shard:
+            tp_size = mapping.attn.tp_size
+            assert intermediate_size % tp_size == 0
+            intermediate_size = intermediate_size // tp_size
         self._fused = FusedGateUpMLP(hidden_size, intermediate_size)
         # Keep individual layers for weight loading, then fuse
         self.gate_proj = W8A8DynamicLinear(hidden_size, intermediate_size)
@@ -806,7 +812,8 @@ class GlmMoeDsaMoE(nn.Module):
         # Shared expert
         if self.n_shared_experts > 0:
             self.shared_experts = GlmMoeDsaMLP(
-                self.hidden_size, self.moe_intermediate_size, mapping
+                self.hidden_size, self.moe_intermediate_size, mapping,
+                tp_shard=True,
             )
         else:
             self.shared_experts = None
@@ -975,10 +982,18 @@ class GlmMoeDsaMoE(nn.Module):
             moe_output = self._forward_quant_gmm(
                 hidden_states, topk_weights, topk_ids, ctx, skip_allreduce=True)
             if self.shared_experts is not None:
-                if self.ep_size > 1:
-                    moe_output = all_reduce(moe_output, self.mapping.attn.tp_group)
                 torch.npu.current_stream().wait_stream(se_stream)
-                output = moe_output + shared_output
+                if self.ep_size > 1:
+                    # Merge MoE + shared expert all_reduce into one:
+                    # all_reduce(moe + shared) instead of all_reduce(moe) + all_reduce(shared)
+                    if self.shared_experts.tp_shard:
+                        output = all_reduce(
+                            moe_output + shared_output, self.mapping.attn.tp_group)
+                    else:
+                        moe_output = all_reduce(moe_output, self.mapping.attn.tp_group)
+                        output = moe_output + shared_output
+                else:
+                    output = moe_output + shared_output
             else:
                 if self.ep_size > 1:
                     moe_output = all_reduce(moe_output, self.mapping.attn.tp_group)
@@ -986,7 +1001,12 @@ class GlmMoeDsaMoE(nn.Module):
         else:
             output = self._forward_grouped_matmul(hidden_states, topk_weights, topk_ids, ctx)
             if self.shared_experts is not None:
-                output = output + self.shared_experts(hidden_states)
+                shared_out = self.shared_experts(hidden_states)
+                if self.shared_experts.tp_shard:
+                    # Merge: all_reduce(output + shared_out) instead of separate all_reduce
+                    output = all_reduce(output + shared_out, self.mapping.attn.tp_group)
+                else:
+                    output = output + shared_out
         return output
 
     def _mc2_available(self):
@@ -1498,7 +1518,12 @@ class GlmMoeDsaModel(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size,
+            tp_rank=mapping.attn.tp_rank,
+            tp_size=mapping.attn.tp_size,
+            tp_group=mapping.attn.tp_group,
+        )
         self.layers = nn.ModuleList([
             GlmMoeDsaDecoderLayer(
                 config, layer_id, mapping=mapping,
@@ -1538,6 +1563,9 @@ class GlmMoeDsaForCausalLM(BaseCausalLM):
         import gc
         for layer in self.model.layers:
             layer.self_attn._maybe_fuse_qkv_a()
+            se = getattr(layer.mlp, "shared_experts", None)
+            if se is not None and hasattr(se, "_maybe_fuse"):
+                se._maybe_fuse()
             if isinstance(layer.mlp, GlmMoeDsaMLP):
                 layer.mlp._maybe_fuse()
             elif hasattr(layer.mlp, "_prepare_grouped_weights"):
@@ -1569,9 +1597,14 @@ class GlmMoeDsaForCausalLM(BaseCausalLM):
         column_shard_suffixes = (
             "q_b_proj.weight", "q_b_proj.deq_scale", "q_b_proj.quant_bias",
             "kv_b_proj.weight",
+            "shared_experts.gate_proj.weight", "shared_experts.gate_proj.weight_scale",
+            "shared_experts.gate_proj.weight_offset",
+            "shared_experts.up_proj.weight", "shared_experts.up_proj.weight_scale",
+            "shared_experts.up_proj.weight_offset",
         )
         row_shard_suffixes = (
             "o_proj.weight",
+            "shared_experts.down_proj.weight",
         )
         # o_proj: deq_scale [out] is NOT sharded (full output)
         # o_proj: quant_bias [out] is NOT sharded
