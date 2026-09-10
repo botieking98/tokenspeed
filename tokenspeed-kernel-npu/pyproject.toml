@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69.5.1", "wheel"]
+requires = ["cmake>=3.26", "pybind11", "setuptools>=69.5.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -23,3 +23,10 @@ license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
+
+[tool.setuptools.package-data]
+tokenspeed_kernel_npu = [
+    "*.so",
+    "lib/*.so",
+    "_cann_ops_custom/vendors/**/*",
+]

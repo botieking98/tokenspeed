@@ -28,7 +28,24 @@ from tokenspeed_kernel.ops.activation import (
     silu_and_mul,
     situ_and_mul,
 )
-from tokenspeed_kernel.ops.attention import attn_merge_state
+from tokenspeed_kernel.ops.attention import (
+    attn_merge_state,
+    dsv4_compressor,
+    dsv4_compressor_metadata,
+    dsv4_inplace_partial_rotary_mul,
+    dsv4_npu_dispatch_ffn_combine,
+    dsv4_npu_grouped_matmul_swiglu_quant_weight_nz,
+    npu_hc_post,
+    npu_hc_pre,
+    dsv4_npu_moe_gating_top_k_hash,
+    dsv4_npu_quant_lightning_indexer,
+    dsv4_npu_quant_lightning_indexer_metadata,
+    dsv4_npu_rms_norm_dynamic_quant,
+    npu_scatter_nd_update,
+    npu_scatter_nd_update_v2,
+    dsv4_npu_sparse_attn_sharedkv,
+    dsv4_npu_sparse_attn_sharedkv_metadata,
+)
 from tokenspeed_kernel.ops.gemm import (
     bmm,
     dsv4_grouped_output_projection,
@@ -127,6 +144,21 @@ __all__ = [
     "grouped_gemma_rmsnorm",
     # attention
     "attn_merge_state",
+    "dsv4_compressor",
+    "dsv4_compressor_metadata",
+    "dsv4_inplace_partial_rotary_mul",
+    "dsv4_npu_dispatch_ffn_combine",
+    "dsv4_npu_grouped_matmul_swiglu_quant_weight_nz",
+    "npu_hc_post",
+    "npu_hc_pre",
+    "dsv4_npu_moe_gating_top_k_hash",
+    "dsv4_npu_quant_lightning_indexer",
+    "dsv4_npu_quant_lightning_indexer_metadata",
+    "dsv4_npu_rms_norm_dynamic_quant",
+    "npu_scatter_nd_update",
+    "npu_scatter_nd_update_v2",
+    "dsv4_npu_sparse_attn_sharedkv",
+    "dsv4_npu_sparse_attn_sharedkv_metadata",
     # activation
     "add3",
     "prepare_fp8_linear_activation",

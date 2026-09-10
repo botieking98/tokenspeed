@@ -121,9 +121,6 @@ def create_cache_pool(
             field_layer_offset=field_layer_offset,
         )
     if spec.family == "deepseek_v4":
-        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
-            HybridDeepseekV4TokenToKVPool,
-        )
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
             DeepseekV4PoolOptions,
         )
@@ -131,9 +128,8 @@ def create_cache_pool(
         options = spec.pool_options
         if not isinstance(options, DeepseekV4PoolOptions):
             raise TypeError("DeepSeek V4 cache spec is missing pool options")
-        return HybridDeepseekV4TokenToKVPool(
-            arena,
-            layout=options.layout,
+        return options.create_pool(
+            arena=arena,
             layer_num=num_layers,
             rank=rank,
             field_layer_offset=field_layer_offset,

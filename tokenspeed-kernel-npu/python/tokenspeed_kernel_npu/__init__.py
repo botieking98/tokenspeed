@@ -19,3 +19,7 @@
 # SOFTWARE.
 
 """Ascend-specific kernels for TokenSpeed."""
+
+from tokenspeed_kernel_npu._ascend import register_cann_vendors
+
+register_cann_vendors()

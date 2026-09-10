@@ -18,28 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Single import boundary for the Triton-Ascend distribution."""
-
-import triton
-from triton import language as tl
-from triton.language.extra import libdevice
-
-try:
-    from triton import profiler as proton
-except ImportError:
-    proton = None
-
-
-@triton.jit
-def _unsupported_pdl_noop():
-    """Keep disabled CUDA PDL branches parseable on Triton-Ascend."""
-    pass
-
-
-if not hasattr(tl.extra.cuda, "gdc_wait"):
-    tl.extra.cuda.gdc_wait = _unsupported_pdl_noop
-if not hasattr(tl.extra.cuda, "gdc_launch_dependents"):
-    tl.extra.cuda.gdc_launch_dependents = _unsupported_pdl_noop
-
-
-__all__ = ["libdevice", "proton", "tl", "triton"]
+"""Ascend attention operators."""

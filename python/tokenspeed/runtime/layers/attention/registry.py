@@ -323,7 +323,10 @@ def _apply_backend_overrides(
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
     elif target.is_deepseek_v4:
-        server_args.attention_backend = "deepseek_v4"
+        if current_platform().is_npu:
+            server_args.attention_backend = "deepseek_v4_npu"
+        else:
+            server_args.attention_backend = "deepseek_v4"
     if draft is not None and draft.is_deepseek_v4:
         server_args.drafter_attention_backend = "deepseek_v4"
 

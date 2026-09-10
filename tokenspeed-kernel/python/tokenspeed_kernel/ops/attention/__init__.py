@@ -102,9 +102,43 @@ def attn_merge_state(
 
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.attention.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
 
+from tokenspeed_kernel.ops.attention.ascend import (  # noqa: E402,F401
+    dsv4_compressor,
+    dsv4_compressor_metadata,
+    dsv4_inplace_partial_rotary_mul,
+    dsv4_npu_dispatch_ffn_combine,
+    dsv4_npu_grouped_matmul_swiglu_quant_weight_nz,
+    dsv4_npu_moe_gating_top_k_hash,
+    dsv4_npu_quant_lightning_indexer,
+    dsv4_npu_quant_lightning_indexer_metadata,
+    dsv4_npu_rms_norm_dynamic_quant,
+    dsv4_npu_sparse_attn_sharedkv,
+    dsv4_npu_sparse_attn_sharedkv_metadata,
+    npu_hc_post,
+    npu_hc_pre,
+    npu_scatter_nd_update,
+    npu_scatter_nd_update_v2,
+)
+
 __all__ = [
     "attn_merge_state",
+    "dsv4_compressor",
+    "dsv4_compressor_metadata",
+    "dsv4_inplace_partial_rotary_mul",
+    "dsv4_npu_dispatch_ffn_combine",
+    "dsv4_npu_grouped_matmul_swiglu_quant_weight_nz",
+    "dsv4_npu_moe_gating_top_k_hash",
+    "dsv4_npu_quant_lightning_indexer",
+    "dsv4_npu_quant_lightning_indexer_metadata",
+    "dsv4_npu_rms_norm_dynamic_quant",
+    "dsv4_npu_sparse_attn_sharedkv",
+    "dsv4_npu_sparse_attn_sharedkv_metadata",
+    "npu_hc_post",
+    "npu_hc_pre",
+    "npu_scatter_nd_update",
+    "npu_scatter_nd_update_v2",
 ]

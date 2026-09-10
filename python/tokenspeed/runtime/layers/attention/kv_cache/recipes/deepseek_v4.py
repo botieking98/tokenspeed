@@ -187,7 +187,28 @@ class DeepseekV4PoolOptions:
                 f"DeepSeek V4 cache layout has no ratios for layers "
                 f"[{first_layer}, {first_layer + num_layers})"
             )
-        return DeepseekV4PoolOptions(layout=replace(self.layout, layer_ratio=ratios))
+        return replace(self, layout=replace(self.layout, layer_ratio=ratios))
+
+    def create_pool(
+        self,
+        *,
+        arena,
+        layer_num: int,
+        rank: int,
+        field_layer_offset: int,
+    ):
+        """Create the default DeepSeek V4 compute view over ``arena``."""
+        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
+            HybridDeepseekV4TokenToKVPool,
+        )
+
+        return HybridDeepseekV4TokenToKVPool(
+            arena,
+            layout=self.layout,
+            layer_num=layer_num,
+            rank=rank,
+            field_layer_offset=field_layer_offset,
+        )
 
 
 class DeepseekV4Recipe(CacheRecipe):

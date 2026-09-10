@@ -1,0 +1,4 @@
+[submodule "tokenspeed-kernel-npu/thirdparty/vllm-ascend"]
+	path = tokenspeed-kernel-npu/thirdparty/vllm-ascend
+	url = https://github.com/vllm-project/vllm-ascend.git
+shallow = true

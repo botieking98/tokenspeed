@@ -862,6 +862,71 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
 
 MTP is not yet validated on MI450.
 
+### Ascend NPU
+
+**V4-Flash W8A8** — 16× Ascend 910C, attention DP4 + TP4 + MoE EP16:
+
+The NPU path targets a DeepSeek V4 Flash W8A8 checkpoint. It selects the NPU
+model implementation and `deepseek_v4_npu` attention backend automatically when
+`--device npu` is set; do not pass `--attention-backend`.
+The validated stack is CANN 9.0.0, PyTorch 2.10.0+cpu, `torch_npu`
+2.10.0.post2, Triton 3.5.0, Triton-Ascend 3.2.1, and Transformers 5.12.0.
+
+Build the NPU kernel package from a checkout that includes the
+`vllm-ascend` submodule. The build compiles the ACLNN operators and
+TokenSpeed's `scatter_nd_update_v2` override:
+
+```bash
+git submodule update --init tokenspeed-kernel-npu/thirdparty/vllm-ascend
+source /usr/local/Ascend/cann-9.0.0/set_env.sh
+SOC_VERSION=ascend910_93 MAX_JOBS=16 \
+  python -m pip install --no-build-isolation --no-deps -e tokenspeed-kernel-npu
+```
+
+Launch DeepSeek-V4-Flash model command:
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export HCCL_BUFFSIZE=1024
+export HCCL_OP_EXPANSION_MODE=AIV
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+tokenspeed serve /path/to/deepseek-v4-flash-w8a8 \
+  --device npu \
+  --served-model-name deepseek-v4-flash \
+  --trust-remote-code \
+  --data-parallel-size 4 \
+  --attn-tp-size 4 \
+  --dense-tp-size 4 \
+  --moe-tp-size 1 \
+  --enable-expert-parallel \
+  --max-model-len 1048576 \
+  --max-total-tokens 1048576 \
+  --max-num-seqs 64 \
+  --chunked-prefill-size 8192 \
+  --prefix-granularity 4096 \
+  --gpu-memory-utilization 0.9 \
+  --max-cudagraph-capture-size 16 \
+  --disable-prefill-graph \
+  --disable-pdl \
+  --disable-kvstore \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --dist-init-addr 127.0.0.1:25000
+```
+
+Ascend 910C does not support FP8 for this path. Do not pass `--kv-cache-dtype
+fp8`, `--kv-cache-dtype fp8_e4m3`, `--quantization w8a8_fp8`, or the FP4
+indexer-cache flag. The model uses dynamic INT8 W8A8 matrix multiplication.
+Its SWA KV pages hold 32 tokens, while compressed-state pages use the geometry
+declared by the NPU cache recipe; do not use `--block-size` to override that
+layout.
+
+`--disable-prefill-graph` and `--disable-pdl` are required by the NPU
+execution path. Decode still uses ACL Graph capture, so do not pass
+`--enforce-eager`. Prefix caching remains available through the cache-group
+scheduler; KVStore is disabled in this recipe.
+
 ### MTP speculative decoding
 
 Both variants can drive the checkpoint's NextN/MTP draft layers. Keep the launch

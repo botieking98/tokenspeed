@@ -27,10 +27,14 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Literal
 
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_npu import (
+    DeepseekV4NpuRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v41 import (
     DeepseekV41Recipe,
@@ -161,6 +165,12 @@ class CacheSetup:
 # family -> how to build its recipe. Every family runs the one pipeline in
 # CacheRecipe.setup(); the class only fills in that family's seams, and the
 # four ordinary families differ by nothing but the family label.
+def _deepseek_v4_recipe(**kwargs) -> CacheRecipe:
+    if current_platform().is_npu:
+        return DeepseekV4NpuRecipe(**kwargs)
+    return DeepseekV4Recipe(**kwargs)
+
+
 _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "mha": partial(OrdinaryRecipe, family="mha"),
     "mla": partial(OrdinaryRecipe, family="mla"),
@@ -171,7 +181,7 @@ _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "inkling": InklingRecipe,
     "kimi_k3": KimiK3Recipe,
     "glm53_flash": Glm53FlashRecipe,
-    "deepseek_v4": DeepseekV4Recipe,
+    "deepseek_v4": _deepseek_v4_recipe,
     "deepseek_v41": DeepseekV41Recipe,
 }
 

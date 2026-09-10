@@ -28,9 +28,31 @@ from functools import lru_cache
 
 import torch.nn as nn
 
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+
+def _entry_platform_matches(model_cls: type[nn.Module]) -> bool:
+    entry_platform = getattr(model_cls, "entry_platform", None)
+    if entry_platform is None:
+        return False
+    platform = current_platform()
+    if entry_platform == "npu":
+        return platform.is_npu
+    if entry_platform == "cuda":
+        return platform.is_nvidia
+    if entry_platform == "amd":
+        return platform.is_amd
+    raise ValueError(f"Unsupported entry platform: {entry_platform}")
+
+
+def _entry_is_applicable(model_cls: type[nn.Module]) -> bool:
+    return (
+        getattr(model_cls, "entry_platform", None) is None
+        or _entry_platform_matches(model_cls)
+    )
 
 
 @dataclass
@@ -105,17 +127,41 @@ def import_model_classes():
                 entry, list
             ):  # To support multiple model classes in one module
                 for tmp in entry:
-                    if tmp.__name__ in model_arch_name_to_cls:
+                    if not _entry_is_applicable(tmp):
+                        continue
+                    existing = model_arch_name_to_cls.get(tmp.__name__)
+                    if existing is None:
+                        model_arch_name_to_cls[tmp.__name__] = tmp
+                    elif _entry_platform_matches(tmp) and not _entry_platform_matches(
+                        existing
+                    ):
+                        model_arch_name_to_cls[tmp.__name__] = tmp
+                    elif not _entry_platform_matches(tmp) and _entry_platform_matches(
+                        existing
+                    ):
+                        continue
+                    else:
                         raise ValueError(
                             f"Duplicated model implementation for {tmp.__name__}"
                         )
-                    model_arch_name_to_cls[tmp.__name__] = tmp
             else:
-                if entry.__name__ in model_arch_name_to_cls:
+                if not _entry_is_applicable(entry):
+                    continue
+                existing = model_arch_name_to_cls.get(entry.__name__)
+                if existing is None:
+                    model_arch_name_to_cls[entry.__name__] = entry
+                elif _entry_platform_matches(entry) and not _entry_platform_matches(
+                    existing
+                ):
+                    model_arch_name_to_cls[entry.__name__] = entry
+                elif not _entry_platform_matches(entry) and _entry_platform_matches(
+                    existing
+                ):
+                    continue
+                else:
                     raise ValueError(
                         f"Duplicated model implementation for {entry.__name__}"
                     )
-                model_arch_name_to_cls[entry.__name__] = entry
 
     return model_arch_name_to_cls
 
