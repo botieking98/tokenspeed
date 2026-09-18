@@ -1512,6 +1512,7 @@ class ModelExecutor:
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],
                     num_extends=num_extends,
                 )
+            self.default_stream.wait_stream(self.execution_stream)
             with nvtx_range("output_d2h", color="green"):
                 output_d2h_start = time.perf_counter() if timing_enabled else 0.0
                 next_input_ids = None
@@ -1567,7 +1568,7 @@ class ModelExecutor:
                 output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = self.device_module.Event()
-                copy_event.record()
+                copy_event.record(self.default_stream)
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
 
