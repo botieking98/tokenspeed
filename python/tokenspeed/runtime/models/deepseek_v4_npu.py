@@ -51,6 +51,7 @@ from tokenspeed_kernel import (
     dsv4_compressor as aclnn_compressor,
     dsv4_compressor_metadata as aclnn_compressor_metadata,
     dsv4_inplace_partial_rotary_mul as inplace_partial_rotary_mul,
+    dsv4_npu_dispatch_ffn_combine as dispatch_ffn_combine,
     npu_hc_post,
     npu_hc_pre,
     dsv4_npu_quant_lightning_indexer as npu_quant_lightning_indexer,
@@ -101,6 +102,10 @@ def _maybe_fractal_nz(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.device.type != "npu":
         return tensor
     return torch_npu.npu_format_cast(tensor, 29)
+
+
+def _float32_scale_to_int64(scale: torch.Tensor) -> torch.Tensor:
+    return scale.contiguous().view(torch.int32).to(torch.int64)
 
 
 class NpuDynamicLinear(nn.Module):
@@ -1115,6 +1120,10 @@ class NpuW8A8Experts(nn.Module):
             else None
         )
         self._weights_processed = False
+        self.fused_w13_weight_scale = None
+        self.fused_w2_weight_scale = None
+        self.fused_scale_bias = None
+        self.fused_expert_token_nums = None
         self.w13_weight = nn.Parameter(
             torch.empty(
                 num_local_experts,
@@ -1165,6 +1174,9 @@ class NpuW8A8Experts(nn.Module):
         self.w13_weight_scale.data = self.w13_weight_scale.data.view(
             self.num_local_experts, -1
         )
+        self.fused_w13_weight_scale = _float32_scale_to_int64(
+            self.w13_weight_scale.data
+        )
         self.w13_weight_scale.data = self.w13_weight_scale.data.to(torch.bfloat16)
         self.w13_weight_offset.data = self.w13_weight_offset.data.view(
             self.num_local_experts, -1
@@ -1172,9 +1184,22 @@ class NpuW8A8Experts(nn.Module):
         self.w2_weight_scale.data = self.w2_weight_scale.data.view(
             self.num_local_experts, -1
         )
+        self.fused_w2_weight_scale = _float32_scale_to_int64(
+            self.w2_weight_scale.data
+        )
         self.w2_weight_scale.data = self.w2_weight_scale.data.to(torch.bfloat16)
         self.w2_weight_offset.data = self.w2_weight_offset.data.view(
             self.num_local_experts, -1
+        )
+        self.fused_scale_bias = torch.empty(
+            (0,),
+            dtype=torch.float32,
+            device=self.w13_weight.device,
+        )
+        self.fused_expert_token_nums = torch.zeros(
+            (self.num_local_experts,),
+            dtype=torch.int32,
+            device=self.w13_weight.device,
         )
         self._weights_processed = True
 
@@ -1376,6 +1401,33 @@ class NpuMoE(nn.Module):
     def _hccl_group(self) -> Any:
         return pg_manager.get_process_group("hccl", self.mapping.moe.tp_ep_group)
 
+    def _fused_moe(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        active_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_weights, topk_ids = self._route(hidden_states, input_ids)
+        routed = torch.empty_like(hidden_states)
+        dispatch_ffn_combine(
+            x=hidden_states,
+            weight1=[self.experts.w13_weight],
+            weight2=[self.experts.w2_weight],
+            expert_idx=topk_ids,
+            scale1=[self.experts.fused_w13_weight_scale],
+            scale2=[self.experts.fused_w2_weight_scale],
+            bias1=[self.experts.fused_scale_bias],
+            bias2=[self.experts.fused_scale_bias],
+            probs=topk_weights.to(torch.float32),
+            group=self._hccl_group_name(),
+            max_output_size=131072,
+            out=routed,
+            expert_token_nums=self.experts.fused_expert_token_nums,
+            x_active_mask=active_mask,
+            swiglu_limit=self.experts.swiglu_limit,
+        )
+        return routed
+
     def _padded_moe_input(
         self,
         hidden_states: torch.Tensor,
@@ -1569,30 +1621,38 @@ class NpuMoE(nn.Module):
             hidden_states, input_ids, padded_num_tokens
         )
         group_name = self._hccl_group_name()
-        routed = None
-        for start in range(0, padded_num_tokens, self.mc2_max_local_tokens):
-            end = min(start + self.mc2_max_local_tokens, padded_num_tokens)
-            combined = self._mc2_chunk(
-                padded_hidden[start:end],
-                (
-                    padded_input_ids[start:end]
-                    if padded_input_ids is not None
-                    else None
-                ),
-                active_mask[start:end],
-                group_name,
+        if padded_num_tokens > self.mc2_max_local_tokens:
+            routed = self._fused_moe(
+                padded_hidden,
+                padded_input_ids,
+                active_mask,
             )
-            if routed is None and start == 0 and end == padded_num_tokens:
-                routed = combined
-            else:
-                if routed is None:
-                    routed = torch.empty(
-                        (padded_num_tokens, hidden_states.shape[-1]),
-                        dtype=hidden_states.dtype,
-                        device=hidden_states.device,
-                    )
-                routed[start:end] = combined
-        routed = routed[: hidden_states.shape[0]]
+        else:
+            routed = None
+            for start in range(0, padded_num_tokens, self.mc2_max_local_tokens):
+                end = min(start + self.mc2_max_local_tokens, padded_num_tokens)
+                combined = self._mc2_chunk(
+                    padded_hidden[start:end],
+                    (
+                        padded_input_ids[start:end]
+                        if padded_input_ids is not None
+                        else None
+                    ),
+                    active_mask[start:end],
+                    group_name,
+                )
+                if routed is None and start == 0 and end == padded_num_tokens:
+                    routed = combined
+                else:
+                    if routed is None:
+                        routed = torch.empty(
+                            (padded_num_tokens, hidden_states.shape[-1]),
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        )
+                    routed[start:end] = combined
+        if hidden_states.shape[0] < padded_num_tokens:
+            routed = routed[: hidden_states.shape[0]]
         if hidden_states.shape[0] == 0:
             return routed
 
