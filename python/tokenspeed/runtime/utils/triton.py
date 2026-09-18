@@ -18,7 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.language as tl
+from tokenspeed_kernel.platform import current_platform
+
+if current_platform().is_npu:
+    import triton  # noqa: TID251
+    import triton.language as tl  # noqa: TID251
+else:
+    import tokenspeed_triton as triton
+    import tokenspeed_triton.language as tl
 
 __all__ = ["tl", "triton"]
