@@ -84,6 +84,7 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 NPU_DSV4_BLOCK_SIZE = 32
 NPU_DSV4_C4_STATE_BLOCK_SIZE = 2
@@ -1313,7 +1314,19 @@ class NpuMoE(nn.Module):
         self.top_k = int(config.num_experts_per_tok)
         self.num_local_experts = self.num_experts // mapping.moe.ep_size
         self.local_expert_start = mapping.moe.ep_rank * self.num_local_experts
-        self.mc2_max_local_tokens = self.MC2_MAX_TOKENS_PER_RANK
+        self.mega_moe_max_num_tokens = int(
+            global_server_args_dict.get(
+                "deepseek_v4_mega_moe_max_num_tokens", 0
+            )
+            or 0
+        )
+        self.decode_moe_max_num_tokens = int(
+            global_server_args_dict["max_num_seqs"]
+        )
+        self.prefill_moe_max_num_tokens = max(
+            int(global_server_args_dict["chunked_prefill_size"]),
+            int(global_server_args_dict.get("prefill_graph_max_tokens", 0) or 0),
+        )
         self.renormalize = bool(config.norm_topk_prob)
         self.routed_scaling_factor = float(
             getattr(config, "routed_scaling_factor", 1.0)
@@ -1420,7 +1433,7 @@ class NpuMoE(nn.Module):
             bias2=[self.experts.fused_scale_bias],
             probs=topk_weights.to(torch.float32),
             group=self._hccl_group_name(),
-            max_output_size=131072,
+            max_output_size=self._max_output_size(hidden_states.shape[0]),
             out=routed,
             expert_token_nums=self.experts.fused_expert_token_nums,
             x_active_mask=active_mask,
@@ -1449,6 +1462,24 @@ class NpuMoE(nn.Module):
         )
         active_mask[:num_tokens] = True
         return hidden_states, input_ids, active_mask
+
+    def _max_output_size(self, padded_num_tokens: int) -> int:
+        if self.mega_moe_max_num_tokens > 0:
+            max_input_tokens = max(
+                padded_num_tokens,
+                self.mega_moe_max_num_tokens,
+            )
+        elif padded_num_tokens > self.MC2_MAX_TOKENS_PER_RANK:
+            max_input_tokens = max(
+                padded_num_tokens,
+                self.prefill_moe_max_num_tokens,
+            )
+        else:
+            max_input_tokens = max(
+                padded_num_tokens,
+                self.decode_moe_max_num_tokens,
+            )
+        return max_input_tokens * self.top_k
 
     def _shared_expert(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.swiglu_limit is None:
@@ -1509,93 +1540,6 @@ class NpuMoE(nn.Module):
             output_dtype=hidden_states.dtype,
         )
 
-    def _mc2_chunk(
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor | None,
-        active_mask: torch.Tensor,
-        group_name: str,
-    ) -> torch.Tensor:
-        topk_weights, topk_ids = self._route(hidden_states, input_ids)
-        dispatch_output = torch_npu.npu_moe_distribute_dispatch_v2(
-            hidden_states,
-            topk_ids,
-            group_name,
-            self.mapping.moe.ep_size,
-            self.mapping.moe.ep_rank,
-            self.num_experts,
-            scales=None,
-            x_active_mask=active_mask,
-            expert_scales=None,
-            elastic_info=None,
-            performance_info=None,
-            group_tp=group_name,
-            tp_world_size=1,
-            tp_rank_id=0,
-            expert_shard_type=0,
-            shared_expert_num=1,
-            shared_expert_rank_num=0,
-            quant_mode=2,
-            global_bs=0,
-            expert_token_nums_type=0,
-            comm_alg="",
-            zero_expert_num=0,
-            copy_expert_num=0,
-            const_expert_num=0,
-            y_dtype=None,
-            x_dtype=None,
-            scales_dtype=None,
-        )
-        (
-            expanded_hidden,
-            expanded_scale,
-            assist_info_for_combine,
-            group_list,
-            ep_recv_counts,
-            tp_recv_counts,
-            expand_scales,
-        ) = dispatch_output[0:7]
-        expert_output = self.experts(
-            expanded_hidden,
-            group_list,
-            pertoken_scale=expanded_scale,
-            prequantized=True,
-        )
-        combined = torch_npu.npu_moe_distribute_combine_v2(
-            expert_output,
-            topk_ids,
-            assist_info_for_combine,
-            ep_recv_counts,
-            topk_weights.to(torch.float32),
-            group_name,
-            self.mapping.moe.ep_size,
-            self.mapping.moe.ep_rank,
-            self.num_experts,
-            tp_send_counts=tp_recv_counts,
-            x_active_mask=active_mask,
-            expand_scales=expand_scales,
-            shared_expert_x=None,
-            elastic_info=None,
-            ori_x=None,
-            const_expert_alpha_1=None,
-            const_expert_alpha_2=None,
-            const_expert_v=None,
-            performance_info=None,
-            group_tp=group_name,
-            tp_world_size=1,
-            tp_rank_id=0,
-            expert_shard_type=0,
-            shared_expert_num=1,
-            shared_expert_rank_num=0,
-            global_bs=0,
-            comm_quant_mode=2,
-            comm_alg="",
-            zero_expert_num=0,
-            copy_expert_num=0,
-            const_expert_num=0,
-        )
-        return combined
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1620,37 +1564,7 @@ class NpuMoE(nn.Module):
         padded_hidden, padded_input_ids, active_mask = self._padded_moe_input(
             hidden_states, input_ids, padded_num_tokens
         )
-        group_name = self._hccl_group_name()
-        if padded_num_tokens > self.mc2_max_local_tokens:
-            routed = self._fused_moe(
-                padded_hidden,
-                padded_input_ids,
-                active_mask,
-            )
-        else:
-            routed = None
-            for start in range(0, padded_num_tokens, self.mc2_max_local_tokens):
-                end = min(start + self.mc2_max_local_tokens, padded_num_tokens)
-                combined = self._mc2_chunk(
-                    padded_hidden[start:end],
-                    (
-                        padded_input_ids[start:end]
-                        if padded_input_ids is not None
-                        else None
-                    ),
-                    active_mask[start:end],
-                    group_name,
-                )
-                if routed is None and start == 0 and end == padded_num_tokens:
-                    routed = combined
-                else:
-                    if routed is None:
-                        routed = torch.empty(
-                            (padded_num_tokens, hidden_states.shape[-1]),
-                            dtype=hidden_states.dtype,
-                            device=hidden_states.device,
-                        )
-                    routed[start:end] = combined
+        routed = self._fused_moe(padded_hidden, padded_input_ids, active_mask)
         if hidden_states.shape[0] < padded_num_tokens:
             routed = routed[: hidden_states.shape[0]]
         if hidden_states.shape[0] == 0:
