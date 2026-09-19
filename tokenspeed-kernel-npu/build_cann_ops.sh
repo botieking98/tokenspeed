@@ -61,6 +61,20 @@ function join_by_comma() {
     printf '%s' "${result}"
 }
 
+function sync_symlink() {
+    local target="$1"
+    local destination="$2"
+
+    if [[ -L "${destination}" && "$(readlink "${destination}")" == "${target}" ]]; then
+        return
+    fi
+    if [[ -d "${destination}" && ! -L "${destination}" ]]; then
+        echo "Refusing to replace directory with symlink: ${destination}" >&2
+        exit 1
+    fi
+    ln -sfn "${target}" "${destination}"
+}
+
 function install_cann_run_package() {
     local source_dir="$1"
     local destination="$2"
@@ -123,26 +137,21 @@ function build_cann_ops() {
 
     ops="$(join_by_comma "${CANN_OPS[@]}")"
 
-    rm -rf \
-        "${staging_dir}" \
-        "${BUILD_DIR}/cann-ops" \
-        "${BUILD_DIR}/vllm-ascend-cann-ops" \
-        "${BUILD_DIR}/tokenspeed-cann-ops" \
-        "${BUILD_DIR}/scatter-cann-source" \
-        "${VLLM_ASCEND_CSRC}/build" \
-        "${VLLM_ASCEND_CSRC}/output" \
-        "${VLLM_ASCEND_CSRC}/build_out"
-
     mkdir -p "${staging_dir}/moe"
-    cp "${VLLM_ASCEND_CSRC}/CMakeLists.txt" "${staging_dir}/CMakeLists.txt"
-    cp "${VLLM_ASCEND_CSRC}/build.sh" "${staging_dir}/build.sh"
-    cp "${VLLM_ASCEND_CSRC}/moe/CMakeLists.txt" "${staging_dir}/moe/CMakeLists.txt"
+    rm -f \
+        "${staging_dir}/CMakeLists.txt" \
+        "${staging_dir}/build.sh" \
+        "${staging_dir}/moe/CMakeLists.txt"
+    cp -a "${VLLM_ASCEND_CSRC}/CMakeLists.txt" "${staging_dir}/CMakeLists.txt"
+    cp -a "${VLLM_ASCEND_CSRC}/build.sh" "${staging_dir}/build.sh"
+    cp -a "${VLLM_ASCEND_CSRC}/moe/CMakeLists.txt" "${staging_dir}/moe/CMakeLists.txt"
     scatter_staging_dir="${staging_dir}/moe/scatter_nd_update_v2"
+    rm -rf "${scatter_staging_dir}"
     cp -a "${VLLM_SCATTER_DIR}" "${scatter_staging_dir}"
-    cp \
+    cp -a \
         "${SCATTER_OVERRIDES_DIR}/op_host/scatter_nd_update_v2_tiling.cpp" \
         "${scatter_staging_dir}/op_host/scatter_nd_update_v2_tiling.cpp"
-    cp \
+    cp -a \
         "${SCATTER_OVERRIDES_DIR}/op_kernel/scatter_nd_update_large_index.h" \
         "${scatter_staging_dir}/op_kernel/scatter_nd_update_large_index.h"
 
@@ -162,12 +171,12 @@ function build_cann_ops() {
         if [[ "${entry_name}" == "moe" ]]; then
             for moe_entry in "${VLLM_ASCEND_CSRC}/moe"/*; do
                 entry_name="$(basename "${moe_entry}")"
-                if [[ ! -e "${staging_dir}/moe/${entry_name}" ]]; then
-                    ln -s "${moe_entry}" "${staging_dir}/moe/${entry_name}"
+                if [[ "${entry_name}" != "CMakeLists.txt" && "${entry_name}" != "scatter_nd_update_v2" ]]; then
+                    sync_symlink "${moe_entry}" "${staging_dir}/moe/${entry_name}"
                 fi
             done
         elif [[ -e "${VLLM_ASCEND_CSRC}/${entry_name}" ]]; then
-            ln -s "${VLLM_ASCEND_CSRC}/${entry_name}" "${staging_dir}/${entry_name}"
+            sync_symlink "${VLLM_ASCEND_CSRC}/${entry_name}" "${staging_dir}/${entry_name}"
         fi
     done
 
