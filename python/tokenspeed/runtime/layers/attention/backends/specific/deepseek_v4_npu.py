@@ -78,6 +78,24 @@ class DeepseekV4NpuAttentionBackend(DeepseekV4AttentionBackend):
             output_buffers=output_buffers,
         )
 
+    @override
+    def _assert_active_cache_pages(
+        self,
+        tables,
+        *,
+        seq_lens,
+        actual_bs,
+        phase,
+    ):
+        """Keep scheduler-owned cache invariants off the NPU decode hot path.
+
+        The scheduler owns active-page publication, and packed-table upload
+        validates page IDs on the host before H2D. Torch NPU's asynchronous
+        assertion synchronizes with the device, which would serialize decode.
+        """
+        if actual_bs == 0:
+            return
+
     def _forward_shared_kv(
         self,
         *,
