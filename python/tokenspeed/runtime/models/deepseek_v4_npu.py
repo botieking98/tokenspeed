@@ -109,6 +109,26 @@ def _float32_scale_to_int64(scale: torch.Tensor) -> torch.Tensor:
     return scale.contiguous().view(torch.int32).to(torch.int64)
 
 
+def _should_skip_indexer_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    if not bool(getattr(config, "use_index_cache", False)):
+        return False
+    if max(1, int(config.compress_ratios[layer_id])) != 4:
+        return False
+    compress_ratios = getattr(config, "compress_ratios", None) or []
+    indexer_sequence_index = sum(
+        1 for ratio in compress_ratios[:layer_id] if int(ratio) == 4
+    )
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is None:
+        frequency = max(1, int(getattr(config, "index_topk_freq", 1)))
+        return max(indexer_sequence_index - 1, 0) % frequency != 0
+    if pattern[0] != "F":
+        raise ValueError("index_topk_pattern must start with 'F'")
+    if 0 <= indexer_sequence_index < len(pattern):
+        return pattern[indexer_sequence_index] == "S"
+    return False
+
+
 class NpuDynamicLinear(nn.Module):
     """Replicated or pre-sharded dynamic W8A8 linear layer."""
 
@@ -686,6 +706,8 @@ class NpuIndexer(nn.Module):
         config: PretrainedConfig,
         prefix: str,
         hadamard: torch.Tensor,
+        topk_indices_buffer: torch.Tensor,
+        skip_topk: bool,
     ) -> None:
         super().__init__()
         self.n_heads = int(config.index_n_heads)
@@ -709,6 +731,8 @@ class NpuIndexer(nn.Module):
             add_prefix("compressor", prefix),
         )
         self.hadamard = hadamard
+        self.topk_indices_buffer = topk_indices_buffer
+        self.skip_topk = skip_topk
 
     def forward(
         self,
@@ -834,6 +858,32 @@ class NpuIndexer(nn.Module):
             cmp_ratio=4,
             return_value=False,
         )
+        if self.topk_indices_buffer is not None:
+            cached_topk_indices = self.topk_indices_buffer[
+                : hidden_states.shape[0], : self.index_topk
+            ]
+            if topk_indices.shape != cached_topk_indices.shape:
+                if topk_indices.ndim != 3 or topk_indices.shape[1] != 1:
+                    raise RuntimeError(
+                        "DeepSeek-V4 NPU IndexCache expects top-k indices "
+                        f"with shape [tokens, 1, topk], got {tuple(topk_indices.shape)}"
+                    )
+                topk_indices = topk_indices.squeeze(1)
+            cached_topk_indices.copy_(topk_indices)
+        return topk_indices.unsqueeze(1)
+
+    def _cached_topk_indices(self, num_tokens: int) -> torch.Tensor:
+        if self.topk_indices_buffer is None:
+            raise RuntimeError(
+                "DeepSeek-V4 NPU IndexCache requires topk_indices_buffer"
+            )
+        if num_tokens > self.topk_indices_buffer.shape[0]:
+            raise RuntimeError(
+                "DeepSeek-V4 NPU IndexCache buffer is smaller than the token batch"
+            )
+        topk_indices = self.topk_indices_buffer[:num_tokens]
+        if topk_indices.ndim == 2:
+            topk_indices = topk_indices.unsqueeze(1)
         return topk_indices
 
 
@@ -845,6 +895,7 @@ class NpuAttention(nn.Module):
         layer_id: int,
         prefix: str,
         hadamard: torch.Tensor,
+        topk_indices_buffer: torch.Tensor,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -919,6 +970,8 @@ class NpuAttention(nn.Module):
                 config,
                 add_prefix("indexer", prefix),
                 hadamard,
+                topk_indices_buffer,
+                _should_skip_indexer_topk(config, layer_id),
             )
             if self.compress_ratio == 4
             else None
@@ -1052,18 +1105,23 @@ class NpuAttention(nn.Module):
 
         topk_indices = None
         if self.indexer is not None:
-            indexer_q = self.indexer._project_query(
-                hidden_states, quant_qr, qr_scale, metadata, self.layer_id
-            )
             if indexer_cache_ready is not None:
                 main_stream.wait_event(indexer_cache_ready)
-            topk_indices = self.indexer._select_topk(
-                hidden_states,
-                indexer_q,
-                metadata,
-                pool,
-                self.layer_id,
-            )
+            if self.indexer.skip_topk:
+                topk_indices = self.indexer._cached_topk_indices(
+                    hidden_states.shape[0]
+                )
+            else:
+                indexer_q = self.indexer._project_query(
+                    hidden_states, quant_qr, qr_scale, metadata, self.layer_id
+                )
+                topk_indices = self.indexer._select_topk(
+                    hidden_states,
+                    indexer_q,
+                    metadata,
+                    pool,
+                    self.layer_id,
+                )
         else:
             main_stream.wait_stream(aux_stream)
         forward_mode = ctx.forward_mode
@@ -1638,6 +1696,7 @@ class NpuDecoderLayer(nn.Module):
         layer_id: int,
         prefix: str,
         hadamard: torch.Tensor,
+        topk_indices_buffer: torch.Tensor,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1648,7 +1707,12 @@ class NpuDecoderLayer(nn.Module):
         hc_dim = self.hc_mult * int(config.hidden_size)
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         self.attn = NpuAttention(
-            config, mapping, layer_id, add_prefix("self_attn", prefix), hadamard
+            config,
+            mapping,
+            layer_id,
+            add_prefix("self_attn", prefix),
+            hadamard,
+            topk_indices_buffer,
         )
         self.ffn = NpuMoE(config, mapping, layer_id, add_prefix("mlp", prefix))
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1777,6 +1841,20 @@ class NpuDeepseekV4Model(nn.Module):
         device = torch.device(torch.npu.current_device())
         self._metadata_builder: NpuDsaMetadataBuilder | None = None
         self.hadamard = _build_hadamard(int(config.index_head_dim), device)
+        if bool(getattr(config, "use_index_cache", False)):
+            buffer_capacity = max(
+                int(global_server_args_dict["chunked_prefill_size"]),
+                int(global_server_args_dict["max_num_seqs"]),
+                int(global_server_args_dict.get("prefill_graph_max_tokens", 0) or 0),
+            )
+            self.topk_indices_buffer = torch.empty(
+                buffer_capacity,
+                int(config.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            self.topk_indices_buffer = None
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -1793,6 +1871,7 @@ class NpuDeepseekV4Model(nn.Module):
                     layer_id,
                     add_prefix(f"layers.{layer_id}", prefix),
                     self.hadamard,
+                    self.topk_indices_buffer,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
