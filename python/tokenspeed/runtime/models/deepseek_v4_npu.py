@@ -1017,6 +1017,7 @@ class NpuAttention(nn.Module):
         _require_torch_npu()
         main_stream = torch.npu.current_stream()
         aux_stream = _get_dsa_overlap_stream()
+        indexer_cache_ready = None
         quant_hidden, hidden_scale = torch_npu.npu_dynamic_quant(
             hidden_states, dst_type=torch.int8
         )
@@ -1071,13 +1072,14 @@ class NpuAttention(nn.Module):
                         compressed_kv,
                     )
             if self.indexer is not None:
-                self.indexer._prepare_cache(
-                    hidden_states,
-                    metadata,
-                    pool,
-                    self.layer_id,
-                    *compress_rope.full(),
-                )
+                if not self.indexer.skip_topk:
+                    self.indexer._prepare_cache(
+                        hidden_states,
+                        metadata,
+                        pool,
+                        self.layer_id,
+                        *compress_rope.full(),
+                    )
                 indexer_cache_ready = aux_stream.record_event()
         q_a = self.wq_a.forward_quantized(
             quant_hidden,
