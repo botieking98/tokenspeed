@@ -1297,6 +1297,8 @@ def _combine_shared_and_routed(
 class NpuMoE(nn.Module):
     MC2_MAX_TOKENS_PER_RANK = 224
     _shared_group_lists: dict[tuple[torch.device, int], torch.Tensor] = {}
+    _active_masks: dict[torch.device, torch.Tensor] = {}
+    _all_active_masks: dict[torch.device, torch.Tensor] = {}
 
     def __init__(
         self,
@@ -1373,7 +1375,32 @@ class NpuMoE(nn.Module):
         if self._shared_weights_processed:
             return
         self.shared_gate_up.process_grouped_weights_after_loading()
+        self._ensure_active_mask_buffers(
+            self.shared_gate_up.weight.device,
+            max(
+                self.MC2_MAX_TOKENS_PER_RANK,
+                self.decode_moe_max_num_tokens,
+                self.prefill_moe_max_num_tokens,
+                self.mega_moe_max_num_tokens,
+            ),
+        )
         self._shared_weights_processed = True
+
+    @classmethod
+    def _ensure_active_mask_buffers(
+        cls, device: torch.device, capacity: int
+    ) -> None:
+        capacity = max(capacity, cls.MC2_MAX_TOKENS_PER_RANK)
+        active_mask = cls._active_masks.get(device)
+        if active_mask is None or active_mask.numel() < capacity:
+            cls._active_masks[device] = torch.zeros(
+                capacity, dtype=torch.bool, device=device
+            )
+        all_active_mask = cls._all_active_masks.get(device)
+        if all_active_mask is None or all_active_mask.numel() < capacity:
+            cls._all_active_masks[device] = torch.ones(
+                capacity, dtype=torch.bool, device=device
+            )
 
     def _route(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None
@@ -1457,11 +1484,38 @@ class NpuMoE(nn.Module):
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
             if input_ids is not None:
                 input_ids = F.pad(input_ids, (0, pad_size))
-        active_mask = torch.zeros(
-            padded_num_tokens, dtype=torch.bool, device=hidden_states.device
+        active_mask = self._active_mask(
+            hidden_states.device, num_tokens, padded_num_tokens
         )
-        active_mask[:num_tokens] = True
         return hidden_states, input_ids, active_mask
+
+    def _active_mask(
+        self, device: torch.device, num_tokens: int, padded_num_tokens: int
+    ) -> torch.Tensor:
+        if num_tokens == padded_num_tokens:
+            all_active_mask = self._all_active_masks.get(device)
+            if all_active_mask is None or all_active_mask.numel() < padded_num_tokens:
+                all_active_mask = torch.ones(
+                    max(padded_num_tokens, self.MC2_MAX_TOKENS_PER_RANK),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                self._all_active_masks[device] = all_active_mask
+            return all_active_mask[:padded_num_tokens]
+
+        active_mask = self._active_masks.get(device)
+        if active_mask is None or active_mask.numel() < padded_num_tokens:
+            active_mask = torch.zeros(
+                max(padded_num_tokens, self.MC2_MAX_TOKENS_PER_RANK),
+                dtype=torch.bool,
+                device=device,
+            )
+            self._active_masks[device] = active_mask
+        active_mask = active_mask[:padded_num_tokens]
+        if self.layer_id == 0:
+            active_mask[:num_tokens] = True
+            active_mask[num_tokens:] = False
+        return active_mask
 
     def _max_output_size(self, padded_num_tokens: int) -> int:
         if self.mega_moe_max_num_tokens > 0:
