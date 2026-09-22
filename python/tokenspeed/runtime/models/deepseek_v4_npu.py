@@ -370,6 +370,9 @@ class NpuDsaRequestMetadata:
     compressed_block_tables: dict[int, torch.Tensor]
     state_block_tables: dict[int, torch.Tensor]
     indexer_state_block_table: torch.Tensor | None
+    compressor_metadata_cache: dict[
+        int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ]
     decode_only: bool = False
 
 
@@ -623,6 +626,7 @@ class NpuDsaMetadataBuilder:
             compressed_block_tables=compressed_tables,
             state_block_tables=state_tables,
             indexer_state_block_table=indexer_state_table,
+            compressor_metadata_cache={},
             decode_only=decode_only,
         )
 
@@ -663,20 +667,35 @@ class NpuCompressor(nn.Module):
         num_tokens = hidden_states.shape[0]
         num_reqs = request_metadata.seq_lens.numel()
         num_compressed = min(num_tokens, num_tokens // self.compress_ratio + num_reqs)
-        flattened_full_cos = full_cos.view(full_cos.shape[0], full_cos.shape[-1])
-        flattened_full_sin = full_sin.view(full_sin.shape[0], full_sin.shape[-1])
-        compress_cos, compress_sin, slot_mapping = aclnn_compressor_metadata(
-            flattened_full_cos,
-            flattened_full_sin,
-            request_metadata.query_start_loc,
-            request_metadata.start_pos,
-            compressed_block_table,
-            kv_block_size=NPU_DSV4_BLOCK_SIZE,
-            slot_mapping_format=DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET,
-            compress_ratio=self.compress_ratio,
-            num_compressed_tokens=num_compressed,
-            num_reqs_actual=num_reqs,
+        cached_metadata = request_metadata.compressor_metadata_cache.get(
+            self.compress_ratio
         )
+        if cached_metadata is not None:
+            compress_cos, compress_sin, slot_mapping = cached_metadata
+        else:
+            flattened_full_cos = full_cos.view(
+                full_cos.shape[0], full_cos.shape[-1]
+            )
+            flattened_full_sin = full_sin.view(
+                full_sin.shape[0], full_sin.shape[-1]
+            )
+            compress_cos, compress_sin, slot_mapping = aclnn_compressor_metadata(
+                flattened_full_cos,
+                flattened_full_sin,
+                request_metadata.query_start_loc,
+                request_metadata.start_pos,
+                compressed_block_table,
+                kv_block_size=NPU_DSV4_BLOCK_SIZE,
+                slot_mapping_format=DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET,
+                compress_ratio=self.compress_ratio,
+                num_compressed_tokens=num_compressed,
+                num_reqs_actual=num_reqs,
+            )
+            request_metadata.compressor_metadata_cache[self.compress_ratio] = (
+                compress_cos,
+                compress_sin,
+                slot_mapping,
+            )
         compressed_kv = aclnn_compressor(
             hidden_states,
             self.wkv.weight,
