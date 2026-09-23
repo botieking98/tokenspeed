@@ -432,6 +432,13 @@ class NpuDsaMetadataBuilder:
         if max_pages is None:
             raise RuntimeError(f"Missing NPU DSV4 graph table width: {group_id}")
         max_pages = max(1, int(max_pages))
+        if (
+            table.device == self.device
+            and table.dtype == torch.int32
+            and int(table.shape[1]) == max_pages
+            and table.is_contiguous()
+        ):
+            return table
         rows = max(self.max_batch_size, int(table.shape[0]))
         buffer = self.block_table_buffers.get(group_id)
         if (
