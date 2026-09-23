@@ -57,6 +57,7 @@ from tokenspeed_kernel import (
     dsv4_npu_quant_lightning_indexer as npu_quant_lightning_indexer,
     dsv4_npu_quant_lightning_indexer_metadata as npu_quant_lightning_indexer_metadata,
     dsv4_npu_rms_norm_dynamic_quant as npu_rms_norm_dynamic_quant,
+    dsv4_npu_moe_gating_top_k_hash as npu_moe_gating_top_k_hash,
     npu_scatter_nd_update,
     npu_scatter_nd_update_v2,
     dsv4_npu_sparse_attn_sharedkv_metadata as npu_sparse_attn_sharedkv_metadata,
@@ -1489,26 +1490,27 @@ class NpuMoE(nn.Module):
             if input_ids is None:
                 raise ValueError("DeepSeek-V4 hash MoE routing requires input_ids")
             input_ids = input_ids.reshape(-1).to(torch.int64)
+            bias = None
+            tid2eid = self.tid2eid
         else:
             input_ids = None
-        scores = torch.sqrt(F.softplus(router_logits))
-        if self.is_hash_moe:
-            topk_ids = self.tid2eid[input_ids].to(torch.int32)
-        else:
-            scores_for_choice = scores
-            if self.e_score_correction_bias is not None:
-                scores_for_choice = scores_for_choice + self.e_score_correction_bias
-            topk_ids = torch.topk(
-                scores_for_choice,
-                k=self.top_k,
-                dim=-1,
-                sorted=True,
-            ).indices
-        topk_weights = scores.gather(1, topk_ids.long())
-        if self.renormalize:
-            topk_weights = topk_weights / topk_weights.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(torch.finfo(topk_weights.dtype).tiny)
+            bias = self.e_score_correction_bias
+            tid2eid = None
+        topk_weights, topk_ids, _ = npu_moe_gating_top_k_hash(
+            x=router_logits,
+            k=self.top_k,
+            bias=bias,
+            input_ids=input_ids,
+            tid2eid=tid2eid,
+            k_group=1,
+            group_count=1,
+            routed_scaling_factor=1.0,
+            eps=1e-20,
+            group_select_mode=1,
+            renorm=0,
+            norm_type=2,
+            out_flag=False,
+        )
         return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
     def _hccl_group_name(self) -> str:
