@@ -256,21 +256,6 @@ def _hadamard_rotate(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
     return out[..., :dim].reshape(shape)
 
 
-def _zero_new_request_state_pages(
-    state_cache: torch.Tensor,
-    state_block_table: torch.Tensor,
-    start_pos: torch.Tensor,
-) -> None:
-    rows = min(int(state_block_table.shape[0]), int(start_pos.numel()))
-    if rows == 0:
-        return
-    new_requests = start_pos == 0
-    pages = state_block_table[: start_pos.numel()][new_requests].reshape(-1)
-    pages = pages[pages >= 0].unique().to(torch.long)
-    if pages.numel() > 0:
-        state_cache.index_fill_(0, pages, 0.0)
-
-
 def _is_npu_graph_capturing(tensor: torch.Tensor) -> bool:
     return (
         tensor.device.type == "npu"
@@ -820,12 +805,6 @@ class NpuIndexer(nn.Module):
         full_compress_sin: torch.Tensor,
     ) -> None:
         indexer_state_cache = pool.get_indexer_state_buffer(layer_id)
-        if not request_metadata.decode_only:
-            _zero_new_request_state_pages(
-                indexer_state_cache,
-                request_metadata.indexer_state_block_table,
-                request_metadata.start_pos,
-            )
         kv, slot_mapping = self.compressor(
             hidden_states,
             indexer_state_cache,
@@ -1078,12 +1057,6 @@ class NpuAttention(nn.Module):
                 state_block_table = metadata.state_block_tables[
                     self.compress_ratio
                 ]
-                if not metadata.decode_only:
-                    _zero_new_request_state_pages(
-                        state_cache,
-                        state_block_table,
-                        metadata.start_pos,
-                    )
                 compressed_kv, compressed_slots = self.compressor(
                     hidden_states,
                     state_cache,
