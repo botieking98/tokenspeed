@@ -69,6 +69,10 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
+from tokenspeed.runtime.distributed.comm_ops import (
+    token_all_gather,
+    token_reduce_scatter,
+)
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -108,6 +112,41 @@ def _maybe_fractal_nz(tensor: torch.Tensor) -> torch.Tensor:
 
 def _float32_scale_to_int64(scale: torch.Tensor) -> torch.Tensor:
     return scale.contiguous().view(torch.int32).to(torch.int64)
+
+
+def _scatter_token_counts(num_tokens: int, tp_size: int) -> list[int]:
+    base_tokens, remainder = divmod(num_tokens, tp_size)
+    return [base_tokens + 1] * remainder + [base_tokens] * (tp_size - remainder)
+
+
+def _moe_padded_num_tokens(
+    ctx: ForwardContext,
+    mapping: Mapping,
+    num_tokens: int,
+) -> int:
+    global_num_tokens = (
+        ctx.collective_global_num_tokens
+        if ctx.collective_global_num_tokens is not None
+        else ctx.global_num_tokens
+    )
+    if global_num_tokens is None:
+        if mapping.attn.has_dp and mapping.moe.has_tp_ep:
+            return max(1, int(num_tokens))
+        return max(1, max(_scatter_token_counts(num_tokens, mapping.attn.tp_size)))
+
+    scattered_counts: list[int] = []
+    stride = mapping.attn.tp_size * mapping.attn.cp_size
+    for attn_dp_rank in range(mapping.attn.dp_size):
+        count_index = attn_dp_rank * stride
+        if count_index >= len(global_num_tokens):
+            raise RuntimeError(
+                "DeepSeek-V4 NPU sequence parallelism has incomplete DP metadata"
+            )
+        dp_num_tokens = int(global_num_tokens[count_index])
+        scattered_counts.extend(
+            _scatter_token_counts(dp_num_tokens, mapping.attn.tp_size)
+        )
+    return max(1, max(scattered_counts))
 
 
 def _should_skip_indexer_topk(config: PretrainedConfig, layer_id: int) -> bool:
@@ -1703,6 +1742,8 @@ class NpuDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        self.mapping = mapping
+        self.attn_tp_rank = mapping.attn.tp_rank
         self.hc_mult = int(config.hc_mult)
         self.hc_sinkhorn_iters = int(config.hc_sinkhorn_iters)
         self.hc_eps = float(config.hc_eps)
@@ -1786,13 +1827,34 @@ class NpuDecoderLayer(nn.Module):
         attn_tp_group: Any,
         tp_size: int,
     ) -> torch.Tensor:
-        global_num_tokens = ctx.global_num_tokens
-        if global_num_tokens:
-            max_full_tokens = max(global_num_tokens)
+        num_tokens = hidden_states.shape[0]
+        use_sequence_parallel = (
+            attn_tp_group is not None
+            and tp_size > 1
+            and ctx.forward_mode is not None
+            and ctx.forward_mode.is_extend_or_mixed()
+        )
+        if use_sequence_parallel:
+            token_counts = _scatter_token_counts(num_tokens, tp_size)
+            local_num_tokens = token_counts[self.attn_tp_rank]
+            token_offset = sum(token_counts[: self.attn_tp_rank])
+            moe_num_tokens = _moe_padded_num_tokens(
+                ctx=ctx,
+                mapping=self.mapping,
+                num_tokens=num_tokens,
+            )
         else:
-            max_full_tokens = hidden_states.shape[0]
-        moe_num_tokens = max(1, int(max_full_tokens))
-        if hidden_states.shape[0] == 0:
+            token_counts = None
+            local_num_tokens = num_tokens
+            token_offset = 0
+            global_num_tokens = ctx.global_num_tokens
+            if global_num_tokens:
+                max_full_tokens = max(global_num_tokens)
+            else:
+                max_full_tokens = num_tokens
+            moe_num_tokens = max(1, int(max_full_tokens))
+
+        if num_tokens == 0:
             moe_input = hidden_states.new_empty((0, hidden_states.shape[-1]))
             self.ffn(
                 moe_input,
@@ -1800,7 +1862,7 @@ class NpuDecoderLayer(nn.Module):
                 padded_num_tokens=moe_num_tokens,
             )
             return hidden_states
-        residual = hidden_states.clone()
+        residual = hidden_states
         hidden_states, post, comb = self._pre(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
@@ -1808,22 +1870,75 @@ class NpuDecoderLayer(nn.Module):
         attn_full = self.attn(
             hidden_states, positions, ctx, metadata, rope, compress_rope, pool
         )
-        if attn_tp_group is not None and tp_size > 1:
-            attn_reduced = attn_full.float()
-            dist.all_reduce(attn_reduced, group=attn_tp_group)
-            attn_full = attn_reduced.to(attn_full.dtype)
-        hidden_states = self._post(attn_full, residual, post, comb)
-        residual = hidden_states.clone()
+        if use_sequence_parallel:
+            attn_local = token_reduce_scatter(
+                attn_full,
+                group=self.mapping.attn.tp_group,
+                scattered_num_tokens=token_counts,
+            )
+            residual = residual[token_offset : token_offset + local_num_tokens]
+            post = post[token_offset : token_offset + local_num_tokens]
+            comb = comb[token_offset : token_offset + local_num_tokens]
+            if local_num_tokens == 0:
+                moe_input_ids = input_ids
+                if input_ids is not None:
+                    if input_ids.shape[0] != num_tokens:
+                        raise RuntimeError(
+                            "DeepSeek-V4 NPU sequence parallelism input ID count "
+                            f"mismatch: input_ids={input_ids.shape[0]}, "
+                            f"tokens={num_tokens}"
+                        )
+                    moe_input_ids = input_ids[token_offset:token_offset]
+                self.ffn(
+                    attn_local,
+                    moe_input_ids,
+                    padded_num_tokens=moe_num_tokens,
+                )
+                local_shape = residual.shape[1:]
+                gathered_hidden_states = token_all_gather(
+                    residual.flatten(1),
+                    group=self.mapping.attn.tp_group,
+                    scattered_num_tokens=token_counts,
+                )
+                return gathered_hidden_states.reshape(
+                    (num_tokens, *local_shape)
+                )
+            hidden_states = self._post(attn_local, residual, post, comb)
+        else:
+            if attn_tp_group is not None and tp_size > 1:
+                dist.all_reduce(attn_full, group=attn_tp_group)
+            hidden_states = self._post(attn_full, residual, post, comb)
+        residual = hidden_states
         hidden_states, post, comb = self._pre(
             hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
+        moe_input_ids = input_ids
+        if use_sequence_parallel and input_ids is not None:
+            if input_ids.shape[0] != num_tokens:
+                raise RuntimeError(
+                    "DeepSeek-V4 NPU sequence parallelism input ID count mismatch: "
+                    f"input_ids={input_ids.shape[0]}, tokens={num_tokens}"
+                )
+            moe_input_ids = input_ids[
+                token_offset : token_offset + local_num_tokens
+            ]
         moe_output = self.ffn(
             hidden_states,
-            input_ids,
+            moe_input_ids,
             padded_num_tokens=moe_num_tokens,
         )
         hidden_states = self._post(moe_output, residual, post, comb)
+        if use_sequence_parallel:
+            local_shape = hidden_states.shape[1:]
+            gathered_hidden_states = token_all_gather(
+                hidden_states.flatten(1),
+                group=self.mapping.attn.tp_group,
+                scattered_num_tokens=token_counts,
+            )
+            hidden_states = gathered_hidden_states.reshape(
+                (num_tokens, *local_shape)
+            )
         return hidden_states
 
 
