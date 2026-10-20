@@ -124,6 +124,17 @@ def _mask_null_compressor_slots(slot_mapping: torch.Tensor) -> torch.Tensor:
     return slot_mapping
 
 
+def _normalize_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    if topk_indices.ndim == 2:
+        return topk_indices.unsqueeze(1)
+    if topk_indices.ndim == 3 and int(topk_indices.shape[1]) == 1:
+        return topk_indices
+    raise RuntimeError(
+        "DeepSeek-V4 NPU expects top-k indices with shape "
+        f"[tokens, 1, topk], got {tuple(topk_indices.shape)}"
+    )
+
+
 def _require_torch_npu() -> None:
     if torch_npu is None:
         raise RuntimeError("deepseek_v4_npu requires torch_npu")
@@ -955,19 +966,12 @@ class NpuIndexer(nn.Module):
             cmp_ratio=4,
             return_value=False,
         )
+        topk_indices = _normalize_topk_indices(topk_indices)
         if self.topk_indices_buffer is not None:
-            cached_topk_indices = self.topk_indices_buffer[
+            self.topk_indices_buffer[
                 : hidden_states.shape[0], : self.index_topk
-            ]
-            if topk_indices.shape != cached_topk_indices.shape:
-                if topk_indices.ndim != 3 or topk_indices.shape[1] != 1:
-                    raise RuntimeError(
-                        "DeepSeek-V4 NPU IndexCache expects top-k indices "
-                        f"with shape [tokens, 1, topk], got {tuple(topk_indices.shape)}"
-                    )
-                topk_indices = topk_indices.squeeze(1)
-            cached_topk_indices.copy_(topk_indices)
-        return topk_indices.unsqueeze(1)
+            ].copy_(topk_indices.squeeze(1))
+        return topk_indices
 
     def _cached_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:

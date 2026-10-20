@@ -29,6 +29,7 @@ from tokenspeed.runtime.models.deepseek_v4_npu import NpuMoE
 from tokenspeed.runtime.models.deepseek_v4_npu import NpuDecoderLayer
 from tokenspeed.runtime.models.deepseek_v4_npu import _mask_null_compressor_slots
 from tokenspeed.runtime.models.deepseek_v4_npu import _moe_padded_num_tokens
+from tokenspeed.runtime.models.deepseek_v4_npu import _normalize_topk_indices
 from tokenspeed.runtime.models.deepseek_v4_npu import _scatter_token_counts
 from tokenspeed.runtime.models.deepseek_v4_npu import _valid_tokens_per_request
 
@@ -163,6 +164,31 @@ def test_mask_null_compressor_slots_skips_null_pages():
 
     assert masked is slot_mapping
     assert masked.tolist() == [[1, 3], [-1, -1], [-1, -1], [2, 7]]
+
+
+def test_normalize_topk_indices_preserves_operator_three_dimensional_output():
+    topk_indices = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+
+    normalized = _normalize_topk_indices(topk_indices=topk_indices)
+
+    assert normalized is topk_indices
+    assert normalized.shape == (2, 1, 2)
+
+
+def test_normalize_topk_indices_expands_two_dimensional_output():
+    topk_indices = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+
+    normalized = _normalize_topk_indices(topk_indices=topk_indices)
+
+    assert normalized.shape == (2, 1, 2)
+    assert normalized.tolist() == [[[1, 2]], [[3, 4]]]
+
+
+def test_normalize_topk_indices_rejects_four_dimensional_output():
+    topk_indices = torch.zeros((1, 1, 1, 2), dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="top-k indices"):
+        _normalize_topk_indices(topk_indices=topk_indices)
 
 
 def test_decoder_layer_does_not_clone_residual(monkeypatch):
