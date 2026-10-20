@@ -27,8 +27,10 @@ from types import SimpleNamespace
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.models.deepseek_v4_npu import NpuMoE
 from tokenspeed.runtime.models.deepseek_v4_npu import NpuDecoderLayer
+from tokenspeed.runtime.models.deepseek_v4_npu import _mask_null_compressor_slots
 from tokenspeed.runtime.models.deepseek_v4_npu import _moe_padded_num_tokens
 from tokenspeed.runtime.models.deepseek_v4_npu import _scatter_token_counts
+from tokenspeed.runtime.models.deepseek_v4_npu import _valid_tokens_per_request
 
 
 @pytest.fixture(autouse=True)
@@ -117,6 +119,52 @@ def test_partial_mask_clears_stale_padding_for_smaller_batches():
     ]
 
 
+def test_padded_moe_input_uses_pointer_stable_valid_token_mask():
+    module = _moe(layer_id=0)
+    hidden_states = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    input_ids = torch.tensor([11, 12, 13], dtype=torch.int64)
+    valid_token_mask = torch.tensor([True, True, True, False])
+
+    padded_hidden, padded_input_ids, active_mask = module._padded_moe_input(
+        hidden_states=hidden_states,
+        input_ids=input_ids,
+        padded_num_tokens=4,
+        active_mask=valid_token_mask,
+    )
+
+    assert padded_hidden.shape == (4, 2)
+    assert padded_input_ids.tolist() == [11, 12, 13, 0]
+    assert active_mask.data_ptr() == valid_token_mask.data_ptr()
+    assert active_mask.tolist() == [True, True, True, False]
+
+    valid_token_mask[2] = False
+    assert active_mask.tolist() == [True, True, False, False]
+
+
+def test_valid_tokens_per_request_excludes_graph_padding_rows():
+    token_to_req_indices = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32)
+    is_valid_token = torch.tensor(
+        [True, True, False, True, False, False], dtype=torch.bool
+    )
+
+    valid_counts = _valid_tokens_per_request(
+        token_to_req_indices=token_to_req_indices,
+        is_valid_token=is_valid_token,
+        num_reqs=2,
+    )
+
+    assert valid_counts.tolist() == [2, 1]
+
+
+def test_mask_null_compressor_slots_skips_null_pages():
+    slot_mapping = torch.tensor([[1, 3], [0, 0], [-1, -1], [2, 7]], dtype=torch.int32)
+
+    masked = _mask_null_compressor_slots(slot_mapping=slot_mapping)
+
+    assert masked is slot_mapping
+    assert masked.tolist() == [[1, 3], [-1, -1], [-1, -1], [2, 7]]
+
+
 def test_decoder_layer_does_not_clone_residual(monkeypatch):
     layer = object.__new__(NpuDecoderLayer)
     layer.hc_mult = 1
@@ -139,7 +187,9 @@ def test_decoder_layer_does_not_clone_residual(monkeypatch):
     layer.input_layernorm = lambda hidden_states: hidden_states
     layer.post_attention_layernorm = lambda hidden_states: hidden_states
     layer.attn = lambda hidden_states, positions, ctx, metadata, rope, compress_rope, pool: hidden_states
-    layer.ffn = lambda hidden_states, input_ids, padded_num_tokens: hidden_states
+    layer.ffn = (
+        lambda hidden_states, input_ids, padded_num_tokens, active_mask: hidden_states
+    )
 
     hidden_states = torch.ones((2, 3))
     ctx = SimpleNamespace(global_num_tokens=[])
@@ -255,7 +305,7 @@ def test_decoder_layer_prefill_shards_residual_and_input_ids(monkeypatch):
     layer.input_layernorm = lambda hidden_states: hidden_states
     layer.post_attention_layernorm = lambda hidden_states: hidden_states
     layer.attn = lambda hidden_states, positions, ctx, metadata, rope, compress_rope, pool: hidden_states
-    layer.ffn = lambda hidden_states, input_ids, padded_num_tokens: (
+    layer.ffn = lambda hidden_states, input_ids, padded_num_tokens, active_mask: (
         calls.setdefault("ffn", []).append(
             (input_ids, padded_num_tokens)
         )
@@ -344,7 +394,7 @@ def test_decoder_layer_empty_prefill_shard_participates_in_collectives(monkeypat
     layer.input_layernorm = lambda hidden_states: hidden_states
     layer.post_attention_layernorm = lambda hidden_states: hidden_states
     layer.attn = lambda hidden_states, positions, ctx, metadata, rope, compress_rope, pool: hidden_states
-    layer.ffn = lambda hidden_states, input_ids, padded_num_tokens: (
+    layer.ffn = lambda hidden_states, input_ids, padded_num_tokens, active_mask: (
         calls.setdefault("ffn", []).append(
             (hidden_states.shape[0], input_ids, padded_num_tokens)
         )

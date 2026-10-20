@@ -98,6 +98,32 @@ DSA_METADATA_BUFFER_SIZE = 1024
 DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET = 2
 
 
+def _valid_tokens_per_request(
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor,
+    num_reqs: int,
+) -> torch.Tensor:
+    valid_counts = torch.zeros(
+        (num_reqs,), dtype=torch.int32, device=token_to_req_indices.device
+    )
+    valid_counts.index_add_(
+        dim=0,
+        index=token_to_req_indices.to(dtype=torch.int64),
+        source=is_valid_token.to(dtype=torch.int32),
+    )
+    return valid_counts
+
+
+def _mask_null_compressor_slots(slot_mapping: torch.Tensor) -> torch.Tensor:
+    if slot_mapping.ndim != 2 or int(slot_mapping.shape[1]) != 2:
+        raise RuntimeError(
+            "DeepSeek-V4 NPU compressor expects block-offset slot mapping, got "
+            f"{tuple(slot_mapping.shape)}"
+        )
+    slot_mapping.masked_fill_(slot_mapping[:, :1].le(0), -1)
+    return slot_mapping
+
+
 def _require_torch_npu() -> None:
     if torch_npu is None:
         raise RuntimeError("deepseek_v4_npu requires torch_npu")
@@ -398,6 +424,8 @@ class NpuDsaRequestMetadata:
     compressor_metadata_cache: dict[
         int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ]
+    is_valid_token: torch.Tensor | None
+    compressor_seqused: torch.Tensor | None
     decode_only: bool = False
 
 
@@ -444,6 +472,9 @@ class NpuDsaMetadataBuilder:
             DSA_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device
         )
         self.seqused_q = torch.empty(0, dtype=torch.int32, device=device)
+        self.compressor_seqused_buffer = torch.zeros(
+            max(1, int(max_batch_size)), dtype=torch.int32, device=device
+        )
         self.block_table_buffers: dict[str, torch.Tensor] = {}
 
     def _block_table(
@@ -501,11 +532,29 @@ class NpuDsaMetadataBuilder:
         query_start_loc = metadata.query_start_loc[: num_reqs + 1].contiguous()
         seq_lens = metadata.seq_lens[:num_reqs].contiguous()
         token_to_req = metadata.token_to_req_indices[:num_tokens].contiguous()
+        query_lens = metadata.query_lens[:num_reqs]
         start_pos = seq_lens - metadata.query_lens[:num_reqs]
         default_cos, default_sin = rope.select(positions)
         compressed_cos, compressed_sin = compress_rope.select(positions)
         forward_mode = metadata.forward_mode
         decode_only = forward_mode is not None and forward_mode.is_decode_or_idle()
+        compressor_seqused = None
+        if metadata.is_valid_token is not None:
+            valid_tokens = metadata.is_valid_token[:num_tokens]
+            valid_counts = _valid_tokens_per_request(
+                token_to_req_indices=token_to_req,
+                is_valid_token=valid_tokens,
+                num_reqs=num_reqs,
+            )
+            compressor_seqused = self.compressor_seqused_buffer[:num_reqs]
+            compressor_seqused.copy_(
+                torch.minimum(
+                    valid_counts,
+                    query_lens.to(
+                        device=valid_counts.device, dtype=torch.int32
+                    ),
+                )
+            )
 
         query_lens_cpu = metadata.query_lens_cpu
         seq_lens_cpu = metadata.seq_lens_cpu
@@ -659,6 +708,8 @@ class NpuDsaMetadataBuilder:
             state_block_tables=state_tables,
             indexer_state_block_table=indexer_state_table,
             compressor_metadata_cache={},
+            is_valid_token=metadata.is_valid_token,
+            compressor_seqused=compressor_seqused,
             decode_only=decode_only,
         )
 
@@ -723,6 +774,7 @@ class NpuCompressor(nn.Module):
                 num_compressed_tokens=num_compressed,
                 num_reqs_actual=num_reqs,
             )
+            slot_mapping = _mask_null_compressor_slots(slot_mapping=slot_mapping)
             request_metadata.compressor_metadata_cache[self.compress_ratio] = (
                 compress_cos,
                 compress_sin,
@@ -739,7 +791,7 @@ class NpuCompressor(nn.Module):
             compress_cos.view(-1, compress_cos.shape[-1]),
             state_block_table,
             request_metadata.query_start_loc,
-            None,
+            request_metadata.compressor_seqused,
             request_metadata.start_pos,
             rope_head_dim=self.rope_head_dim,
             cmp_ratio=self.compress_ratio,
@@ -1573,6 +1625,7 @@ class NpuMoE(nn.Module):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
         padded_num_tokens: int,
+        active_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         num_tokens = hidden_states.shape[0]
         pad_size = padded_num_tokens - hidden_states.shape[0]
@@ -1584,6 +1637,8 @@ class NpuMoE(nn.Module):
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
             if input_ids is not None:
                 input_ids = F.pad(input_ids, (0, pad_size))
+        if active_mask is not None and active_mask.numel() >= padded_num_tokens:
+            return hidden_states, input_ids, active_mask[:padded_num_tokens]
         active_mask = self._active_mask(
             hidden_states.device, num_tokens, padded_num_tokens
         )
@@ -1699,6 +1754,7 @@ class NpuMoE(nn.Module):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
         padded_num_tokens: int,
+        active_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         _require_torch_npu()
         padded_num_tokens = max(1, int(padded_num_tokens))
@@ -1716,7 +1772,10 @@ class NpuMoE(nn.Module):
                 shared_ready.record()
 
         padded_hidden, padded_input_ids, active_mask = self._padded_moe_input(
-            hidden_states, input_ids, padded_num_tokens
+            hidden_states,
+            input_ids,
+            padded_num_tokens,
+            active_mask,
         )
         routed = self._fused_moe(padded_hidden, padded_input_ids, active_mask)
         if hidden_states.shape[0] < padded_num_tokens:
@@ -1828,6 +1887,7 @@ class NpuDecoderLayer(nn.Module):
         tp_size: int,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
+        moe_active_mask = metadata.is_valid_token if metadata is not None else None
         use_sequence_parallel = (
             attn_tp_group is not None
             and tp_size > 1
@@ -1860,6 +1920,7 @@ class NpuDecoderLayer(nn.Module):
                 moe_input,
                 input_ids,
                 padded_num_tokens=moe_num_tokens,
+                active_mask=moe_active_mask,
             )
             return hidden_states
         residual = hidden_states
@@ -1893,6 +1954,7 @@ class NpuDecoderLayer(nn.Module):
                     attn_local,
                     moe_input_ids,
                     padded_num_tokens=moe_num_tokens,
+                    active_mask=moe_active_mask,
                 )
                 local_shape = residual.shape[1:]
                 gathered_hidden_states = token_all_gather(
@@ -1927,6 +1989,7 @@ class NpuDecoderLayer(nn.Module):
             hidden_states,
             moe_input_ids,
             padded_num_tokens=moe_num_tokens,
+            active_mask=moe_active_mask,
         )
         hidden_states = self._post(moe_output, residual, post, comb)
         if use_sequence_parallel:
