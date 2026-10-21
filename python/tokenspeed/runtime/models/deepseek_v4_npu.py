@@ -152,9 +152,18 @@ def _float32_scale_to_int64(scale: torch.Tensor) -> torch.Tensor:
     return scale.contiguous().view(torch.int32).to(torch.int64)
 
 
-def _scatter_token_counts(num_tokens: int, tp_size: int) -> list[int]:
-    base_tokens, remainder = divmod(num_tokens, tp_size)
-    return [base_tokens + 1] * remainder + [base_tokens] * (tp_size - remainder)
+def _sp_padded_num_tokens(num_tokens: int, tp_size: int) -> int:
+    return ((num_tokens + tp_size - 1) // tp_size) * tp_size
+
+
+def _sp_pad_first_dim(
+    tensor: torch.Tensor, padded_num_tokens: int
+) -> torch.Tensor:
+    pad_size = padded_num_tokens - tensor.shape[0]
+    if pad_size <= 0:
+        return tensor
+    padding = tensor.new_zeros((pad_size, *tensor.shape[1:]))
+    return torch.cat((tensor, padding), dim=0)
 
 
 def _moe_padded_num_tokens(
@@ -170,7 +179,11 @@ def _moe_padded_num_tokens(
     if global_num_tokens is None:
         if mapping.attn.has_dp and mapping.moe.has_tp_ep:
             return max(1, int(num_tokens))
-        return max(1, max(_scatter_token_counts(num_tokens, mapping.attn.tp_size)))
+        return max(
+            1,
+            _sp_padded_num_tokens(num_tokens, mapping.attn.tp_size)
+            // mapping.attn.tp_size,
+        )
 
     scattered_counts: list[int] = []
     stride = mapping.attn.tp_size * mapping.attn.cp_size
@@ -181,8 +194,9 @@ def _moe_padded_num_tokens(
                 "DeepSeek-V4 NPU sequence parallelism has incomplete DP metadata"
             )
         dp_num_tokens = int(global_num_tokens[count_index])
-        scattered_counts.extend(
-            _scatter_token_counts(dp_num_tokens, mapping.attn.tp_size)
+        scattered_counts.append(
+            _sp_padded_num_tokens(dp_num_tokens, mapping.attn.tp_size)
+            // mapping.attn.tp_size
         )
     return max(1, max(scattered_counts))
 
@@ -2044,8 +2058,19 @@ class NpuMoE(nn.Module):
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_size))
             if input_ids is not None:
                 input_ids = F.pad(input_ids, (0, pad_size))
-        if active_mask is not None and active_mask.numel() >= padded_num_tokens:
-            return hidden_states, input_ids, active_mask[:padded_num_tokens]
+        if active_mask is not None:
+            if active_mask.shape[0] < num_tokens:
+                raise RuntimeError(
+                    "DeepSeek-V4 NPU MoE active mask is shorter than the token batch"
+                )
+            active_mask = active_mask[:num_tokens]
+            if padded_num_tokens > num_tokens:
+                active_mask = F.pad(
+                    active_mask,
+                    (0, padded_num_tokens - num_tokens),
+                    value=False,
+                )
+            return hidden_states, input_ids, active_mask
         active_mask = self._active_mask(
             hidden_states.device, num_tokens, padded_num_tokens
         )
@@ -2295,6 +2320,8 @@ class NpuDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         moe_active_mask = metadata.is_valid_token if metadata is not None else None
+        if moe_active_mask is not None:
+            moe_active_mask = moe_active_mask[:num_tokens]
         use_sequence_parallel = (
             attn_tp_group is not None
             and tp_size > 1
@@ -2302,9 +2329,17 @@ class NpuDecoderLayer(nn.Module):
             and ctx.forward_mode.is_extend_or_mixed()
         )
         if use_sequence_parallel:
-            token_counts = _scatter_token_counts(num_tokens, tp_size)
-            local_num_tokens = token_counts[self.attn_tp_rank]
-            token_offset = sum(token_counts[: self.attn_tp_rank])
+            padded_num_tokens = _sp_padded_num_tokens(num_tokens, tp_size)
+            local_num_tokens = padded_num_tokens // tp_size
+            token_offset = local_num_tokens * self.attn_tp_rank
+            token_counts = [local_num_tokens] * tp_size
+            if moe_active_mask is not None:
+                moe_active_mask = _sp_pad_first_dim(
+                    moe_active_mask,
+                    padded_num_tokens,
+                )[
+                    token_offset : token_offset + local_num_tokens
+                ]
             moe_num_tokens = _moe_padded_num_tokens(
                 ctx=ctx,
                 mapping=self.mapping,
@@ -2336,42 +2371,37 @@ class NpuDecoderLayer(nn.Module):
         )
         hidden_states = self.input_layernorm(hidden_states)
         attn_full = self.attn(
-            hidden_states, positions, ctx, metadata, rope, compress_rope, pool
+            hidden_states,
+            positions,
+            ctx,
+            metadata,
+            rope,
+            compress_rope,
+            pool,
+            attn_tp_group,
         )
         if use_sequence_parallel:
+            attn_full = _sp_pad_first_dim(
+                attn_full,
+                padded_num_tokens,
+            )
             attn_local = token_reduce_scatter(
                 attn_full,
                 group=self.mapping.attn.tp_group,
                 scattered_num_tokens=token_counts,
             )
-            residual = residual[token_offset : token_offset + local_num_tokens]
-            post = post[token_offset : token_offset + local_num_tokens]
-            comb = comb[token_offset : token_offset + local_num_tokens]
-            if local_num_tokens == 0:
-                moe_input_ids = input_ids
-                if input_ids is not None:
-                    if input_ids.shape[0] != num_tokens:
-                        raise RuntimeError(
-                            "DeepSeek-V4 NPU sequence parallelism input ID count "
-                            f"mismatch: input_ids={input_ids.shape[0]}, "
-                            f"tokens={num_tokens}"
-                        )
-                    moe_input_ids = input_ids[token_offset:token_offset]
-                self.ffn(
-                    attn_local,
-                    moe_input_ids,
-                    padded_num_tokens=moe_num_tokens,
-                    active_mask=moe_active_mask,
-                )
-                local_shape = residual.shape[1:]
-                gathered_hidden_states = token_all_gather(
-                    residual.flatten(1),
-                    group=self.mapping.attn.tp_group,
-                    scattered_num_tokens=token_counts,
-                )
-                return gathered_hidden_states.reshape(
-                    (num_tokens, *local_shape)
-                )
+            residual = _sp_pad_first_dim(
+                residual,
+                padded_num_tokens,
+            )[token_offset : token_offset + local_num_tokens]
+            post = _sp_pad_first_dim(
+                post,
+                padded_num_tokens,
+            )[token_offset : token_offset + local_num_tokens]
+            comb = _sp_pad_first_dim(
+                comb,
+                padded_num_tokens,
+            )[token_offset : token_offset + local_num_tokens]
             hidden_states = self._post(attn_local, residual, post, comb)
         else:
             if attn_tp_group is not None and tp_size > 1:
@@ -2389,7 +2419,10 @@ class NpuDecoderLayer(nn.Module):
                     "DeepSeek-V4 NPU sequence parallelism input ID count mismatch: "
                     f"input_ids={input_ids.shape[0]}, tokens={num_tokens}"
                 )
-            moe_input_ids = input_ids[
+            moe_input_ids = _sp_pad_first_dim(
+                input_ids,
+                padded_num_tokens,
+            )[
                 token_offset : token_offset + local_num_tokens
             ]
         moe_output = self.ffn(
@@ -2407,8 +2440,9 @@ class NpuDecoderLayer(nn.Module):
                 scattered_num_tokens=token_counts,
             )
             hidden_states = gathered_hidden_states.reshape(
-                (num_tokens, *local_shape)
+                (padded_num_tokens, *local_shape)
             )
+            hidden_states = hidden_states[:num_tokens]
         return hidden_states
 
 
