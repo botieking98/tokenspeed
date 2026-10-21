@@ -639,11 +639,11 @@ class NpuDsaMetadataBuilder:
         )
         local_query_start_loc = self.local_query_start_loc_buffer[: num_reqs + 1]
         local_query_start_loc.copy_(
-            local_query_start_loc_cpu.to(torch.int32), non_blocking=True
+            local_query_start_loc_cpu.to(torch.int32)
         )
         local_seq_lens = self.local_seq_lens_buffer[:num_reqs]
         local_seq_lens.copy_(
-            local_seq_lens_cpu.to(torch.int32), non_blocking=True
+            local_seq_lens_cpu.to(torch.int32)
         )
         max_local_query_len = max(1, int(local_query_lens.max().item()))
         max_local_seq_len = max(1, int(local_seq_lens_cpu.max().item()))
