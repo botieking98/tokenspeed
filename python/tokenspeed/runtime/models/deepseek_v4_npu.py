@@ -70,6 +70,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     v4_compressor_state_group_id,
 )
 from tokenspeed.runtime.distributed.comm_ops import (
+    all_to_all_single,
     token_all_gather,
     token_reduce_scatter,
 )
@@ -438,6 +439,7 @@ class NpuDsaRequestMetadata:
     is_valid_token: torch.Tensor | None
     compressor_seqused: torch.Tensor | None
     decode_only: bool = False
+    local_metadata: "NpuDsaRequestMetadata | None" = None
 
 
 class NpuDsaMetadataBuilder:
@@ -449,6 +451,8 @@ class NpuDsaMetadataBuilder:
         pool: HybridDeepseekV4NpuTokenToKVPool,
         device: torch.device,
         num_local_heads: int,
+        attn_tp_rank: int,
+        attn_tp_size: int,
         max_context_len: int,
         max_batch_size: int,
         max_table_pages: dict[str, int],
@@ -457,6 +461,9 @@ class NpuDsaMetadataBuilder:
         self.pool = pool
         self.device = device
         self.num_local_heads = num_local_heads
+        self.num_heads = int(config.num_attention_heads)
+        self.attn_tp_rank = int(attn_tp_rank)
+        self.attn_tp_size = int(attn_tp_size)
         self.max_context_len = max(1, int(max_context_len))
         self.max_batch_size = max(1, int(max_batch_size))
         self.max_table_pages = max_table_pages
@@ -479,8 +486,27 @@ class NpuDsaMetadataBuilder:
             )
             for ratio in (1, 4, 128)
         }
+        self.local_sas_buffers = {
+            ratio: torch.zeros(
+                DSA_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device
+            )
+            for ratio in (1, 4, 128)
+        }
         self.qli_buffer = torch.zeros(
             DSA_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device
+        )
+        self.local_qli_buffer = torch.zeros(
+            DSA_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device
+        )
+        self.local_query_start_loc_buffer = torch.zeros(
+            max(1, int(max_batch_size)) + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.local_seq_lens_buffer = torch.zeros(
+            max(1, int(max_batch_size)),
+            dtype=torch.int32,
+            device=device,
         )
         self.seqused_q = torch.empty(0, dtype=torch.int32, device=device)
         self.compressor_seqused_buffer = torch.zeros(
@@ -530,6 +556,252 @@ class NpuDsaMetadataBuilder:
             )
         )
         return buffer[: table.shape[0], :max_pages]
+
+    def _build_local_metadata(
+        self,
+        metadata: Any,
+        num_tokens: int,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        start_pos: torch.Tensor,
+        default_cos: dict[int, torch.Tensor],
+        default_sin: dict[int, torch.Tensor],
+        compressed_cos: torch.Tensor,
+        compressed_sin: torch.Tensor,
+        swa_table: torch.Tensor,
+        swa_slots: torch.Tensor,
+        compressed_tables: dict[int, torch.Tensor],
+        state_tables: dict[int, torch.Tensor],
+        indexer_state_table: torch.Tensor | None,
+        has_prefill: bool,
+        decode_only: bool,
+    ) -> NpuDsaRequestMetadata:
+        num_reqs = int(metadata.seq_lens.numel())
+        if metadata.query_lens_cpu is not None and metadata.query_lens_cpu.numel() >= num_reqs:
+            query_lens_cpu = metadata.query_lens_cpu[:num_reqs].to(torch.int64)
+            global_query_start_loc_cpu = torch.cat(
+                (
+                    torch.zeros(
+                        (1,), dtype=torch.int64, device=query_lens_cpu.device
+                    ),
+                    torch.cumsum(query_lens_cpu, dim=0),
+                )
+            )
+        else:
+            global_query_start_loc_cpu = query_start_loc.detach().to(
+                device="cpu", dtype=torch.int64
+            )
+        if metadata.seq_lens_cpu is not None and metadata.seq_lens_cpu.numel() >= num_reqs:
+            seq_lens_cpu = metadata.seq_lens_cpu[:num_reqs].to(torch.int64)
+        else:
+            seq_lens_cpu = seq_lens.detach().to(device="cpu", dtype=torch.int64)
+
+        padded_num_tokens = (
+            (num_tokens + self.attn_tp_size - 1) // self.attn_tp_size
+        ) * self.attn_tp_size
+        tokens_per_rank = padded_num_tokens // self.attn_tp_size
+        local_start = self.attn_tp_rank * tokens_per_rank
+        local_end_with_pad = local_start + tokens_per_rank
+        local_actual_end = min(local_end_with_pad, num_tokens)
+        local_query_start = global_query_start_loc_cpu[:-1].clamp(
+            min=local_start, max=local_end_with_pad
+        )
+        local_query_end = global_query_start_loc_cpu[1:].clamp(
+            min=local_start, max=local_end_with_pad
+        )
+        local_query_lens = local_query_end - local_query_start
+        local_query_start_loc_cpu = torch.cat(
+            (
+                torch.zeros((1,), dtype=torch.int64),
+                torch.cumsum(local_query_lens, dim=0),
+            )
+        )
+        offset = global_query_start_loc_cpu[1:] - local_query_end
+        valid_local_req = (local_query_lens > 0) & (seq_lens_cpu > 0)
+        local_seq_lens_cpu = torch.where(
+            valid_local_req,
+            torch.clamp_min(seq_lens_cpu - offset, 0),
+            torch.zeros_like(seq_lens_cpu),
+        )
+        local_query_start_loc = self.local_query_start_loc_buffer[: num_reqs + 1]
+        local_query_start_loc.copy_(
+            local_query_start_loc_cpu.to(torch.int32), non_blocking=True
+        )
+        local_seq_lens = self.local_seq_lens_buffer[:num_reqs]
+        local_seq_lens.copy_(
+            local_seq_lens_cpu.to(torch.int32), non_blocking=True
+        )
+        max_local_query_len = max(1, int(local_query_lens.max().item()))
+        max_local_seq_len = max(1, int(local_seq_lens_cpu.max().item()))
+
+        local_cu_ori = local_query_start_loc if has_prefill else None
+        local_cu_cmp: dict[int, torch.Tensor] = {}
+        for ratio in self.compress_ratios:
+            if has_prefill:
+                local_cu_cmp[ratio] = None
+            else:
+                local_cu_cmp[ratio] = torch.empty(
+                    0, dtype=torch.int32, device=self.device
+                )
+
+        for ratio in (1, *self.compress_ratios):
+            built = npu_sparse_attn_sharedkv_metadata(
+                num_heads_q=self.num_heads,
+                num_heads_kv=1,
+                head_dim=int(self.config.head_dim),
+                cu_seqlens_q=local_query_start_loc,
+                cu_seqlens_ori_kv=local_cu_ori,
+                cu_seqlens_cmp_kv=local_cu_cmp.get(ratio),
+                seqused_q=self.seqused_q,
+                seqused_kv=local_seq_lens,
+                batch_size=num_reqs,
+                max_seqlen_q=max_local_query_len,
+                max_seqlen_kv=max_local_seq_len,
+                ori_topk=0,
+                cmp_topk=self.index_topk if ratio == 4 else 0,
+                cmp_ratio=max(ratio, 1),
+                ori_mask_mode=4,
+                cmp_mask_mode=3,
+                ori_win_left=self.window_size - 1,
+                ori_win_right=0,
+                layout_q="TND",
+                layout_kv="PA_ND",
+                has_ori_kv=True,
+                has_cmp_kv=ratio > 1,
+                device=str(self.device),
+            )
+            self.local_sas_buffers[ratio].copy_(built)
+
+        local_qli_metadata = None
+        if 4 in self.compress_ratios:
+            built = npu_quant_lightning_indexer_metadata(
+                num_heads_q=self.index_n_heads,
+                num_heads_k=1,
+                head_dim=self.index_head_dim,
+                query_quant_mode=0,
+                key_quant_mode=0,
+                actual_seq_lengths_query=local_query_start_loc[1:],
+                actual_seq_lengths_key=local_seq_lens,
+                batch_size=num_reqs,
+                max_seqlen_q=max_local_query_len,
+                max_seqlen_k=max_local_seq_len,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+                cmp_ratio=4,
+                device=str(self.device),
+            )
+            self.local_qli_buffer.copy_(built)
+            local_qli_metadata = self.local_qli_buffer
+
+        local_default_cos = {}
+        local_default_sin = {}
+        for layer_id, cos in default_cos.items():
+            padded_cos = cos
+            if padded_cos.shape[0] < padded_num_tokens:
+                padded_cos = F.pad(
+                    padded_cos,
+                    (
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        padded_num_tokens - padded_cos.shape[0],
+                    ),
+                )
+            local_default_cos[layer_id] = padded_cos[
+                local_start:local_end_with_pad
+            ]
+        for layer_id, sin in default_sin.items():
+            padded_sin = sin
+            if padded_sin.shape[0] < padded_num_tokens:
+                padded_sin = F.pad(
+                    padded_sin,
+                    (
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        padded_num_tokens - padded_sin.shape[0],
+                    ),
+                )
+            local_default_sin[layer_id] = padded_sin[
+                local_start:local_end_with_pad
+            ]
+        local_token_to_req = metadata.token_to_req_indices[
+            local_start:local_end_with_pad
+        ]
+        if local_token_to_req.shape[0] < padded_num_tokens:
+            local_token_to_req = F.pad(
+                local_token_to_req,
+                (0, padded_num_tokens - local_token_to_req.shape[0]),
+            )
+        if metadata.is_valid_token is None:
+            local_valid_tokens = None
+        else:
+            local_valid_tokens = metadata.is_valid_token[
+                local_start:local_end_with_pad
+            ]
+            if local_valid_tokens.shape[0] < padded_num_tokens:
+                local_valid_tokens = F.pad(
+                    local_valid_tokens,
+                    (0, padded_num_tokens - local_valid_tokens.shape[0]),
+                )
+
+        return NpuDsaRequestMetadata(
+            query_start_loc=local_query_start_loc,
+            cu_ori_seqlens=local_cu_ori,
+            seq_lens=local_seq_lens,
+            token_to_req_indices=local_token_to_req,
+            start_pos=start_pos,
+            swa_block_table=swa_table,
+            swa_slot_mapping=swa_slots,
+            sas_metadata=self.local_sas_buffers,
+            qli_metadata=local_qli_metadata,
+            default_cos=local_default_cos,
+            default_sin=local_default_sin,
+            compress_cos=F.pad(
+                compressed_cos,
+                (
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    padded_num_tokens - compressed_cos.shape[0],
+                ),
+            )[local_start:local_end_with_pad],
+            compress_sin=F.pad(
+                compressed_sin,
+                (
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    padded_num_tokens - compressed_sin.shape[0],
+                ),
+            )[local_start:local_end_with_pad],
+            cu_cmp_seqlens=local_cu_cmp,
+            compressed_block_tables=compressed_tables,
+            state_block_tables=state_tables,
+            indexer_state_block_table=indexer_state_table,
+            compressor_metadata_cache={},
+            is_valid_token=local_valid_tokens,
+            compressor_seqused=None,
+            decode_only=decode_only,
+        )
 
     def build(
         self,
@@ -700,6 +972,27 @@ class NpuDsaMetadataBuilder:
                 layer_cos[layer_id] = default_cos
                 layer_sin[layer_id] = default_sin
 
+        local_metadata = None
+        if not decode_only and self.attn_tp_size > 1:
+            local_metadata = self._build_local_metadata(
+                metadata,
+                num_tokens,
+            query_start_loc,
+            seq_lens,
+            start_pos,
+            layer_cos,
+                layer_sin,
+                compressed_cos,
+                compressed_sin,
+                swa_table,
+                swa_slots,
+                compressed_tables,
+                state_tables,
+                indexer_state_table,
+                has_prefill,
+                decode_only,
+            )
+
         return NpuDsaRequestMetadata(
             query_start_loc=query_start_loc,
             cu_ori_seqlens=cu_ori,
@@ -722,6 +1015,7 @@ class NpuDsaMetadataBuilder:
             is_valid_token=metadata.is_valid_token,
             compressor_seqused=compressor_seqused,
             decode_only=decode_only,
+            local_metadata=local_metadata,
         )
 
 
@@ -999,10 +1293,12 @@ class NpuAttention(nn.Module):
         topk_indices_buffer: torch.Tensor,
     ) -> None:
         super().__init__()
+        self.mapping = mapping
         self.layer_id = layer_id
         self.compress_ratio = max(1, int(config.compress_ratios[layer_id]))
         self.num_heads = int(config.num_attention_heads)
         self.num_local_heads = self.num_heads // mapping.attn.tp_size
+        self.local_head_start = self.num_local_heads * mapping.attn.tp_rank
         self.head_dim = int(config.head_dim)
         self.rope_head_dim = int(config.qk_rope_head_dim)
         self.nope_head_dim = self.head_dim - self.rope_head_dim
@@ -1029,7 +1325,7 @@ class NpuAttention(nn.Module):
         self.wkv = NpuDynamicLinear(config.hidden_size, self.head_dim)
         self.wq_b = NpuDynamicLinear(
             self.q_lora_rank,
-            self.num_local_heads * self.head_dim,
+            self.num_heads * self.head_dim,
         )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
         self.kv_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -1037,7 +1333,7 @@ class NpuAttention(nn.Module):
             torch.ones(self.head_dim), requires_grad=False
         )
         self.attn_sink = nn.Parameter(
-            torch.full((self.num_local_heads,), -float("inf"), dtype=torch.float32),
+            torch.full((self.num_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,
         )
         self.wo_a = nn.Parameter(
@@ -1103,6 +1399,26 @@ class NpuAttention(nn.Module):
         z = z.reshape(num_tokens, -1)
         return F.linear(z, self.wo_b)
 
+    def _exchange_tp_head_layout(
+        self,
+        attn_output: torch.Tensor,
+        tokens_per_rank: int,
+    ) -> torch.Tensor:
+        send = (
+            attn_output.view(
+                tokens_per_rank,
+                self.mapping.attn.tp_size,
+                self.num_local_heads,
+                self.head_dim,
+            )
+            .permute(1, 0, 2, 3)
+            .contiguous()
+            .view(-1, self.num_local_heads, self.head_dim)
+        )
+        recv = torch.empty_like(send)
+        all_to_all_single(recv, send, self.mapping.attn.tp_group)
+        return recv
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1112,10 +1428,31 @@ class NpuAttention(nn.Module):
         rope: NpuYarnRopeCache,
         compress_rope: NpuYarnRopeCache,
         pool: HybridDeepseekV4NpuTokenToKVPool,
+        attn_tp_group: Any,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
         _require_torch_npu()
+        forward_mode = ctx.forward_mode
+        if forward_mode is None:
+            raise RuntimeError("DeepSeek V4 NPU attention requires forward mode")
+        use_query_sharding = (
+            attn_tp_group is not None
+            and self.mapping.attn.tp_size > 1
+            and forward_mode.is_extend_or_mixed()
+        )
+        if use_query_sharding:
+            padded_num_tokens = (
+                hidden_states.shape[0] + self.mapping.attn.tp_size - 1
+            ) // self.mapping.attn.tp_size * self.mapping.attn.tp_size
+            tokens_per_rank = padded_num_tokens // self.mapping.attn.tp_size
+            token_offset = tokens_per_rank * self.mapping.attn.tp_rank
+            token_end = min(token_offset + tokens_per_rank, hidden_states.shape[0])
+        else:
+            padded_num_tokens = hidden_states.shape[0]
+            tokens_per_rank = hidden_states.shape[0]
+            token_offset = 0
+            token_end = hidden_states.shape[0]
         main_stream = torch.npu.current_stream()
         aux_stream = _get_dsa_overlap_stream()
         indexer_cache_ready = None
@@ -1176,9 +1513,39 @@ class NpuAttention(nn.Module):
                         *compress_rope.full(),
                     )
                 indexer_cache_ready = aux_stream.record_event()
+        if use_query_sharding:
+            query_quant_hidden = quant_hidden
+            query_hidden_scale = hidden_scale
+            query_hidden_states = hidden_states
+            if query_quant_hidden.shape[0] < padded_num_tokens:
+                query_quant_hidden = F.pad(
+                    query_quant_hidden,
+                    (0, 0, 0, padded_num_tokens - query_quant_hidden.shape[0]),
+                )
+                query_hidden_scale = F.pad(
+                    query_hidden_scale,
+                    (0, padded_num_tokens - query_hidden_scale.shape[0]),
+                )
+                query_hidden_states = F.pad(
+                    query_hidden_states,
+                    (0, 0, 0, padded_num_tokens - query_hidden_states.shape[0]),
+                )
+            query_quant_hidden = query_quant_hidden[
+                token_offset : token_offset + tokens_per_rank
+            ]
+            query_hidden_scale = query_hidden_scale[
+                token_offset : token_offset + tokens_per_rank
+            ]
+            query_hidden_states = query_hidden_states[
+                token_offset : token_offset + tokens_per_rank
+            ]
+        else:
+            query_quant_hidden = quant_hidden[token_offset:token_end]
+            query_hidden_scale = hidden_scale[token_offset:token_end]
+            query_hidden_states = hidden_states[token_offset:token_end]
         q_a = self.wq_a.forward_quantized(
-            quant_hidden,
-            hidden_scale,
+            query_quant_hidden,
+            query_hidden_scale,
             output_dtype=hidden_states.dtype,
         )
         quant_qr, qr_scale = npu_rms_norm_dynamic_quant(
@@ -1190,12 +1557,28 @@ class NpuAttention(nn.Module):
             self.wq_b.weight_scale,
             pertoken_scale=qr_scale,
             output_dtype=hidden_states.dtype,
-        ).view(-1, self.num_local_heads, self.head_dim)
-        q = torch_npu.npu_rms_norm(q, self.q_head_norm_weight, epsilon=self.eps)[0]
+        ).view(-1, self.num_heads, self.head_dim)
+        if use_query_sharding:
+            query_metadata = metadata.local_metadata
+            if query_metadata is None:
+                raise RuntimeError(
+                    "DeepSeek V4 NPU query sharding requires local metadata"
+                )
+        else:
+            query_metadata = metadata
+            q = q[
+                :,
+                self.local_head_start : self.local_head_start
+                + self.num_local_heads,
+                :,
+            ]
+        q = torch_npu.npu_rms_norm(
+            q, self.q_head_norm_weight, epsilon=self.eps
+        )[0]
         inplace_partial_rotary_mul(
             q.unsqueeze(1),
-            metadata.default_cos[self.layer_id],
-            metadata.default_sin[self.layer_id],
+            query_metadata.default_cos[self.layer_id],
+            query_metadata.default_sin[self.layer_id],
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
@@ -1206,24 +1589,25 @@ class NpuAttention(nn.Module):
                 main_stream.wait_event(indexer_cache_ready)
             if self.indexer.skip_topk:
                 topk_indices = self.indexer._cached_topk_indices(
-                    hidden_states.shape[0]
+                    query_hidden_states.shape[0]
                 )
             else:
                 indexer_q = self.indexer._project_query(
-                    hidden_states, quant_qr, qr_scale, metadata, self.layer_id
+                    query_hidden_states,
+                    quant_qr,
+                    qr_scale,
+                    query_metadata,
+                    self.layer_id,
                 )
                 topk_indices = self.indexer._select_topk(
-                    hidden_states,
+                    query_hidden_states,
                     indexer_q,
-                    metadata,
+                    query_metadata,
                     pool,
                     self.layer_id,
                 )
         else:
             main_stream.wait_stream(aux_stream)
-        forward_mode = ctx.forward_mode
-        if forward_mode is None:
-            raise RuntimeError("DeepSeek V4 NPU attention requires forward mode")
         backend_kwargs = {
             "q": q,
             "positions": positions,
@@ -1231,14 +1615,28 @@ class NpuAttention(nn.Module):
             "layer_id": self.layer_id,
             "kind": self.attention_kind,
             "compress_ratio": self.compress_ratio,
-            "num_local_heads": self.num_local_heads,
-            "padded_heads": self.num_local_heads,
+            "num_local_heads": (
+                self.num_heads if use_query_sharding else self.num_local_heads
+            ),
+            "padded_heads": (
+                self.num_heads if use_query_sharding else self.num_local_heads
+            ),
             "head_dim": self.head_dim,
             "window_size": self.window_size,
             "softmax_scale": self.scale,
-            "attn_sink": self.attn_sink,
+            "attn_sink": (
+                self.attn_sink
+                if use_query_sharding
+                else self.attn_sink[
+                    self.local_head_start : self.local_head_start
+                    + self.num_local_heads
+                ]
+            ),
             "topk_indices": topk_indices,
             "npu_metadata": metadata,
+            "local_npu_metadata": (
+                metadata.local_metadata if use_query_sharding else None
+            ),
         }
         if forward_mode.is_mixed():
             attn_output = ctx.attn_backend.forward_deepseek_v4_mixed(
@@ -1256,6 +1654,11 @@ class NpuAttention(nn.Module):
             raise RuntimeError(
                 f"Unsupported DeepSeek V4 NPU forward mode: {forward_mode}"
             )
+        if use_query_sharding:
+            attn_output = self._exchange_tp_head_layout(
+                attn_output,
+                tokens_per_rank,
+            )[: hidden_states.shape[0]]
         return self._project_output(attn_output, metadata)
 
 
@@ -2150,6 +2553,8 @@ class NpuDeepseekV4Model(nn.Module):
                     pool,
                     positions.device,
                     self.layers[0].attn.num_local_heads,
+                    self.mapping.attn.tp_rank,
+                    self.mapping.attn.tp_size,
                     max_context_len=ctx.attn_backend.context_len,
                     max_batch_size=graph.max_bs,
                     max_table_pages={
@@ -2370,14 +2775,17 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 self.lm_head.weight_loader(param, loaded)
                 continue
             if ".attn.attn_sink" in name:
-                local_heads = param.shape[0]
-                start = tp_rank * local_heads
-                param.data.copy_(loaded[start : start + local_heads])
+                if param.shape == loaded.shape:
+                    param.data.copy_(loaded)
+                else:
+                    local_heads = param.shape[0]
+                    start = tp_rank * local_heads
+                    param.data.copy_(loaded[start : start + local_heads])
                 continue
             if ".attn.wq_b." in name:
                 output_slice = name.endswith(
                     (".weight", ".weight_scale", ".weight_offset")
-                )
+                ) and param.shape[0] != loaded.shape[0]
                 if not self._load_dynamic(
                     name, param, loaded, output_slice=output_slice, rank=tp_rank
                 ):

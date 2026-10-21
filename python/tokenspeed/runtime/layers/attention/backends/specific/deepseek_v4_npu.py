@@ -108,11 +108,15 @@ class DeepseekV4NpuAttentionBackend(DeepseekV4AttentionBackend):
         attn_sink,
         topk_indices,
         npu_metadata,
+        local_npu_metadata,
     ):
         if npu_metadata is None:
             raise RuntimeError("DeepSeek V4 NPU attention requires ACLNN metadata")
         if compress_ratio <= 0:
             raise ValueError(f"invalid DeepSeek V4 NPU compress ratio: {compress_ratio}")
+        active_metadata = npu_metadata
+        if local_npu_metadata is not None:
+            active_metadata = local_npu_metadata
         compressed = (
             token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
             if compress_ratio > 1
@@ -129,13 +133,13 @@ class DeepseekV4NpuAttentionBackend(DeepseekV4AttentionBackend):
                 if compress_ratio > 1
                 else None
             ),
-            cu_seqlens_q=npu_metadata.query_start_loc,
-            cu_seqlens_ori_kv=npu_metadata.cu_ori_seqlens,
-            cu_seqlens_cmp_kv=npu_metadata.cu_cmp_seqlens.get(compress_ratio),
+            cu_seqlens_q=active_metadata.query_start_loc,
+            cu_seqlens_ori_kv=active_metadata.cu_ori_seqlens,
+            cu_seqlens_cmp_kv=active_metadata.cu_cmp_seqlens.get(compress_ratio),
             seqused_q=None,
-            seqused_kv=npu_metadata.seq_lens,
+            seqused_kv=active_metadata.seq_lens,
             sinks=attn_sink,
-            metadata=npu_metadata.sas_metadata[compress_ratio],
+            metadata=active_metadata.sas_metadata[compress_ratio],
             softmax_scale=softmax_scale,
             cmp_ratio=compress_ratio,
             ori_mask_mode=4,
@@ -164,6 +168,7 @@ class DeepseekV4NpuAttentionBackend(DeepseekV4AttentionBackend):
         topk_indices,
         metadata=None,
         npu_metadata=None,
+        local_npu_metadata,
     ):
         del positions, kind, num_local_heads, padded_heads, head_dim, metadata
         return self._forward_shared_kv(
@@ -176,6 +181,7 @@ class DeepseekV4NpuAttentionBackend(DeepseekV4AttentionBackend):
             attn_sink=attn_sink,
             topk_indices=topk_indices,
             npu_metadata=npu_metadata,
+            local_npu_metadata=local_npu_metadata,
         )
 
     def forward_deepseek_v4_mixed(
@@ -196,6 +202,7 @@ class DeepseekV4NpuAttentionBackend(DeepseekV4AttentionBackend):
         topk_indices,
         metadata=None,
         npu_metadata=None,
+        local_npu_metadata,
     ):
         del positions, kind, num_local_heads, padded_heads, head_dim, metadata
         return self._forward_shared_kv(
@@ -208,6 +215,7 @@ class DeepseekV4NpuAttentionBackend(DeepseekV4AttentionBackend):
             attn_sink=attn_sink,
             topk_indices=topk_indices,
             npu_metadata=npu_metadata,
+            local_npu_metadata=local_npu_metadata,
         )
 
     def forward_deepseek_v4_prefill(
@@ -228,6 +236,7 @@ class DeepseekV4NpuAttentionBackend(DeepseekV4AttentionBackend):
         topk_indices,
         metadata=None,
         npu_metadata=None,
+        local_npu_metadata,
     ):
         del positions, kind, num_local_heads, padded_heads, head_dim, metadata
         return self._forward_shared_kv(
@@ -240,6 +249,7 @@ class DeepseekV4NpuAttentionBackend(DeepseekV4AttentionBackend):
             attn_sink=attn_sink,
             topk_indices=topk_indices,
             npu_metadata=npu_metadata,
+            local_npu_metadata=local_npu_metadata,
         )
 
 
