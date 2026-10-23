@@ -69,11 +69,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
-from tokenspeed.runtime.distributed.comm_ops import (
-    all_to_all_single,
-    token_all_gather,
-    token_reduce_scatter,
-)
+from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -164,6 +160,26 @@ def _sp_pad_first_dim(
         return tensor
     padding = tensor.new_zeros((pad_size, *tensor.shape[1:]))
     return torch.cat((tensor, padding), dim=0)
+
+
+def _sp_reduce_scatter_equal(
+    tensor: torch.Tensor,
+    group: dist.ProcessGroup,
+    local_num_tokens: int,
+) -> torch.Tensor:
+    output = tensor.new_empty((local_num_tokens, *tensor.shape[1:]))
+    dist.reduce_scatter_tensor(output, tensor, group=group)
+    return output
+
+
+def _sp_all_gather_equal(
+    tensor: torch.Tensor,
+    group: dist.ProcessGroup,
+    padded_num_tokens: int,
+) -> torch.Tensor:
+    output = tensor.new_empty((padded_num_tokens, *tensor.shape[1:]))
+    dist.all_gather_into_tensor(output, tensor, group=group)
+    return output
 
 
 def _moe_padded_num_tokens(
@@ -2332,7 +2348,6 @@ class NpuDecoderLayer(nn.Module):
             padded_num_tokens = _sp_padded_num_tokens(num_tokens, tp_size)
             local_num_tokens = padded_num_tokens // tp_size
             token_offset = local_num_tokens * self.attn_tp_rank
-            token_counts = [local_num_tokens] * tp_size
             if moe_active_mask is not None:
                 moe_active_mask = _sp_pad_first_dim(
                     moe_active_mask,
@@ -2346,7 +2361,6 @@ class NpuDecoderLayer(nn.Module):
                 num_tokens=num_tokens,
             )
         else:
-            token_counts = None
             local_num_tokens = num_tokens
             token_offset = 0
             global_num_tokens = ctx.global_num_tokens
@@ -2385,10 +2399,10 @@ class NpuDecoderLayer(nn.Module):
                 attn_full,
                 padded_num_tokens,
             )
-            attn_local = token_reduce_scatter(
+            attn_local = _sp_reduce_scatter_equal(
                 attn_full,
-                group=self.mapping.attn.tp_group,
-                scattered_num_tokens=token_counts,
+                group=attn_tp_group,
+                local_num_tokens=local_num_tokens,
             )
             residual = _sp_pad_first_dim(
                 residual,
@@ -2434,10 +2448,10 @@ class NpuDecoderLayer(nn.Module):
         hidden_states = self._post(moe_output, residual, post, comb)
         if use_sequence_parallel:
             local_shape = hidden_states.shape[1:]
-            gathered_hidden_states = token_all_gather(
+            gathered_hidden_states = _sp_all_gather_equal(
                 hidden_states.flatten(1),
-                group=self.mapping.attn.tp_group,
-                scattered_num_tokens=token_counts,
+                group=attn_tp_group,
+                padded_num_tokens=padded_num_tokens,
             )
             hidden_states = gathered_hidden_states.reshape(
                 (padded_num_tokens, *local_shape)
