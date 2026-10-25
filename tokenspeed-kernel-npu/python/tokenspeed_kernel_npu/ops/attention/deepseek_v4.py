@@ -18,67 +18,15 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-"""DeepSeek-V4 Flash Ascend operators.
-
-TokenSpeed owns ``npu_scatter_nd_update_v2``. Other custom operators come from
-the vllm-ascend-derived extension bundled inside ``tokenspeed-kernel-npu``.
-"""
+"""DeepSeek-V4 Flash Ascend operators."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import torch
 
-from tokenspeed_kernel_npu._ascend import register_cann_vendors
 from tokenspeed_kernel_npu._vllm_ascend import ensure_vllm_ascend_ops
-
-
-_PACKAGE_LIBRARY_PATH = (
-    Path(__file__).resolve().parents[2] / "lib" / "libtokenspeed_ascend_c.so"
-)
-_BUILD_LIBRARY_PATH = (
-    Path(__file__).resolve().parents[4]
-    / "build"
-    / "ascend"
-    / "tokenspeed-extension"
-    / "libtokenspeed_ascend_c.so"
-)
-_LIBRARY_PATHS = (_PACKAGE_LIBRARY_PATH, _BUILD_LIBRARY_PATH)
-_TOKENSPEED_LIBRARY_LOADED = False
-
-
-def _ensure_tokenspeed_library() -> None:
-    """Load TokenSpeed's native ``npu_scatter_nd_update_v2`` binding."""
-    global _TOKENSPEED_LIBRARY_LOADED
-    if _TOKENSPEED_LIBRARY_LOADED:
-        return
-
-    registered_vendors = register_cann_vendors()
-    if not any(
-        vendor_path.name == "custom_transformer"
-        for vendor_path in registered_vendors
-    ):
-        raise FileNotFoundError(
-            "TokenSpeed CANN vendor not found. Build "
-            "tokenspeed-kernel-npu with CANN and torch_npu installed, or "
-            "install a wheel containing "
-            "tokenspeed_kernel_npu/_cann_ops_custom/vendors/custom_transformer."
-        )
-
-    library_path = next(
-        (candidate for candidate in _LIBRARY_PATHS if candidate.exists()),
-        None,
-    )
-    if library_path is None:
-        raise FileNotFoundError(
-            f"TokenSpeed Ascend kernel library not found: "
-            f"{_PACKAGE_LIBRARY_PATH} or {_BUILD_LIBRARY_PATH}."
-        )
-
-    torch.ops.load_library(str(library_path))
-    _TOKENSPEED_LIBRARY_LOADED = True
 
 
 def _vllm_ascend_ops() -> Any:
@@ -104,12 +52,15 @@ def compressor_metadata_out(*args: Any, **kwargs: Any) -> Any:
 
 def npu_quant_lightning_indexer(*args: Any, **kwargs: Any) -> Any:
     """Run the quantized lightning indexer."""
-    return _vllm_ascend_ops().npu_vllm_quant_lightning_indexer(*args, **kwargs)
+    return _vllm_ascend_ops().npu_quant_lightning_indexer_v2(
+        *args,
+        **kwargs,
+    )
 
 
 def npu_quant_lightning_indexer_metadata(*args: Any, **kwargs: Any) -> Any:
     """Build lightning-indexer metadata."""
-    return _vllm_ascend_ops().npu_vllm_quant_lightning_indexer_metadata(
+    return _vllm_ascend_ops().npu_quant_lightning_indexer_v2_metadata(
         *args,
         **kwargs,
     )
@@ -145,19 +96,13 @@ def npu_rms_norm_dynamic_quant(*args: Any, **kwargs: Any) -> Any:
     return _vllm_ascend_ops().npu_rms_norm_dynamic_quant(*args, **kwargs)
 
 
-def npu_scatter_nd_update(*args: Any, **kwargs: Any) -> Any:
-    """Run TokenSpeed's scatter update operator."""
-    return npu_scatter_nd_update_v2(*args, **kwargs)
-
-
-def npu_scatter_nd_update_v2(
+def npu_scatter_nd_update_sk(
     var: torch.Tensor,
     indices: torch.Tensor,
     update: torch.Tensor,
 ) -> None:
-    """Scatter ``update`` into ``var`` using TokenSpeed's CANN operator."""
-    _ensure_tokenspeed_library()
-    torch.ops.tokenspeed_ascend.npu_scatter_nd_update_v2(var, indices, update)
+    """Scatter ``update`` into ``var`` using vLLM-Ascend's SK operator."""
+    _vllm_ascend_ops().npu_scatter_nd_update_sk(var, indices, update)
 
 
 def npu_moe_gating_top_k_hash(*args: Any, **kwargs: Any) -> Any:
@@ -194,8 +139,7 @@ __all__ = [
     "npu_quant_lightning_indexer",
     "npu_quant_lightning_indexer_metadata",
     "npu_rms_norm_dynamic_quant",
-    "npu_scatter_nd_update",
-    "npu_scatter_nd_update_v2",
+    "npu_scatter_nd_update_sk",
     "npu_sparse_attn_sharedkv",
     "npu_sparse_attn_sharedkv_metadata",
 ]

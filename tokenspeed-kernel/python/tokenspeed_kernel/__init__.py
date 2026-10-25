@@ -41,8 +41,7 @@ from tokenspeed_kernel.ops.attention import (
     dsv4_npu_quant_lightning_indexer,
     dsv4_npu_quant_lightning_indexer_metadata,
     dsv4_npu_rms_norm_dynamic_quant,
-    npu_scatter_nd_update,
-    npu_scatter_nd_update_v2,
+    npu_scatter_nd_update_sk,
     dsv4_npu_sparse_attn_sharedkv,
     dsv4_npu_sparse_attn_sharedkv_metadata,
 )
@@ -155,8 +154,7 @@ __all__ = [
     "dsv4_npu_quant_lightning_indexer",
     "dsv4_npu_quant_lightning_indexer_metadata",
     "dsv4_npu_rms_norm_dynamic_quant",
-    "npu_scatter_nd_update",
-    "npu_scatter_nd_update_v2",
+    "npu_scatter_nd_update_sk",
     "dsv4_npu_sparse_attn_sharedkv",
     "dsv4_npu_sparse_attn_sharedkv_metadata",
     # activation

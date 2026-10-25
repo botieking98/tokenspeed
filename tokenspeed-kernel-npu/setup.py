@@ -34,7 +34,6 @@ from wheel.bdist_wheel import bdist_wheel
 
 ROOT = Path(__file__).resolve().parent
 BUILD = ROOT / "build" / "ascend"
-LIB_SOURCE = BUILD / "tokenspeed-extension" / "libtokenspeed_ascend_c.so"
 CANN_OPS_SCRIPT = ROOT / "build_cann_ops.sh"
 CANN_OPS_SOURCE = BUILD / "cann_ops" / "vendors"
 VLLM_ASCEND_EXTENSION_SOURCE = BUILD / "vllm-ascend-extension"
@@ -65,9 +64,6 @@ class BuildPyWithAscend(build_py):
 
         if self.build_lib:
             package_root = Path(self.build_lib) / "tokenspeed_kernel_npu"
-            library_destination = package_root / "lib"
-            library_destination.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(LIB_SOURCE, library_destination / LIB_SOURCE.name)
             for extension_source in VLLM_ASCEND_EXTENSION_SOURCE.glob(
                 "vllm_ascend_C*.so"
             ):
@@ -105,7 +101,6 @@ setup(
     package_data={
         "tokenspeed_kernel_npu": [
             "*.so",
-            "lib/*.so",
             "_cann_ops_custom/vendors/**/*",
         ]
     },

@@ -180,15 +180,9 @@ if current_platform().is_npu:
         ),
         (
             "transform",
-            "dsv4_scatter_nd_update",
-            "ascend_aclnn_dsv4_scatter_nd_update",
-            _dsv4_ops.npu_scatter_nd_update,
-        ),
-        (
-            "transform",
-            "dsv4_scatter_nd_update_v2",
-            "ascend_aclnn_dsv4_scatter_nd_update_v2",
-            _dsv4_ops.npu_scatter_nd_update_v2,
+            "dsv4_scatter_nd_update_sk",
+            "ascend_aclnn_dsv4_scatter_nd_update_sk",
+            _dsv4_ops.npu_scatter_nd_update_sk,
         ),
     ):
         _register_aclnn(
@@ -212,8 +206,7 @@ __all__ = [
     "dsv4_npu_quant_lightning_indexer",
     "dsv4_npu_quant_lightning_indexer_metadata",
     "dsv4_npu_rms_norm_dynamic_quant",
-    "npu_scatter_nd_update",
-    "npu_scatter_nd_update_v2",
+    "npu_scatter_nd_update_sk",
     "dsv4_npu_sparse_attn_sharedkv",
     "dsv4_npu_sparse_attn_sharedkv_metadata",
     "mha_decode_with_kvcache",
@@ -288,15 +281,8 @@ def dsv4_npu_rms_norm_dynamic_quant(*args, **kwargs):
     )
 
 
-def npu_scatter_nd_update(*args, **kwargs):
-    return _select_aclnn("transform", "dsv4_scatter_nd_update")(
-        *args,
-        **kwargs,
-    )
-
-
-def npu_scatter_nd_update_v2(*args, **kwargs):
-    return _select_aclnn("transform", "dsv4_scatter_nd_update_v2")(
+def npu_scatter_nd_update_sk(*args, **kwargs):
+    return _select_aclnn("transform", "dsv4_scatter_nd_update_sk")(
         *args,
         **kwargs,
     )

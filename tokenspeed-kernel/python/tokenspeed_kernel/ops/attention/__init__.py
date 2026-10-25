@@ -120,8 +120,7 @@ from tokenspeed_kernel.ops.attention.ascend import (  # noqa: E402,F401
     dsv4_npu_sparse_attn_sharedkv_metadata,
     npu_hc_post,
     npu_hc_pre,
-    npu_scatter_nd_update,
-    npu_scatter_nd_update_v2,
+    npu_scatter_nd_update_sk,
 )
 
 __all__ = [
@@ -139,6 +138,5 @@ __all__ = [
     "dsv4_npu_sparse_attn_sharedkv_metadata",
     "npu_hc_post",
     "npu_hc_pre",
-    "npu_scatter_nd_update",
-    "npu_scatter_nd_update_v2",
+    "npu_scatter_nd_update_sk",
 ]

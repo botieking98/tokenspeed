@@ -4,8 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ASCEND_DIR="${ROOT_DIR}/thirdparty/vllm-ascend"
 VLLM_ASCEND_CSRC="${VLLM_ASCEND_DIR}/csrc"
-SCATTER_OVERRIDES_DIR="${ROOT_DIR}/csrc/cann_ops/moe/scatter_nd_update_v2"
-VLLM_SCATTER_DIR="${VLLM_ASCEND_CSRC}/moe/scatter_nd_update_v2"
 BUILD_DIR="${ROOT_DIR}/build/ascend"
 SOC_VERSION="${1:?usage: build_cann_ops.sh <soc-version> <jobs> <python>}"
 JOBS="${2:?usage: build_cann_ops.sh <soc-version> <jobs> <python>}"
@@ -38,13 +36,13 @@ VLLM_CANN_OPS=(
     rms_norm_dynamic_quant
     sparse_attn_sharedkv
     sparse_attn_sharedkv_metadata
-    vllm_quant_lightning_indexer
-    vllm_quant_lightning_indexer_metadata
+    quant_lightning_indexer_v2
+    quant_lightning_indexer_v2_metadata
 )
 
 CANN_OPS=(
     "${VLLM_CANN_OPS[@]}"
-    scatter_nd_update_v2
+    scatter_nd_update_sk
 )
 
 function join_by_comma() {
@@ -111,29 +109,10 @@ function prepare_vllm_ascend_sources() {
     fi
 }
 
-function build_tokenspeed_extension() {
-    local build_root="${BUILD_DIR}/tokenspeed-extension"
-    local torch_cmake_prefix
-
-    torch_cmake_prefix="$(
-        "${PYTHON_BIN}" -c 'from pathlib import Path; import torch; print(Path(torch.__file__).resolve().parent / "share" / "cmake")'
-    )"
-    rm -rf "${build_root}"
-    cmake \
-        -S "${ROOT_DIR}/csrc" \
-        -B "${build_root}" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_PREFIX_PATH="${torch_cmake_prefix}" \
-        -DPYTHON_EXECUTABLE="${PYTHON_BIN}" \
-        -DASCEND_HOME_PATH="${CANN_HOME}"
-    cmake --build "${build_root}" --parallel "${JOBS}"
-}
-
 function build_cann_ops() {
     local ops
     local staging_dir="${BUILD_DIR}/cann-source"
     local entry_name
-    local scatter_staging_dir
 
     ops="$(join_by_comma "${CANN_OPS[@]}")"
 
@@ -145,16 +124,6 @@ function build_cann_ops() {
     cp -a "${VLLM_ASCEND_CSRC}/CMakeLists.txt" "${staging_dir}/CMakeLists.txt"
     cp -a "${VLLM_ASCEND_CSRC}/build.sh" "${staging_dir}/build.sh"
     cp -a "${VLLM_ASCEND_CSRC}/moe/CMakeLists.txt" "${staging_dir}/moe/CMakeLists.txt"
-    scatter_staging_dir="${staging_dir}/moe/scatter_nd_update_v2"
-    rm -rf "${scatter_staging_dir}"
-    cp -a "${VLLM_SCATTER_DIR}" "${scatter_staging_dir}"
-    cp -a \
-        "${SCATTER_OVERRIDES_DIR}/op_host/scatter_nd_update_v2_tiling.cpp" \
-        "${scatter_staging_dir}/op_host/scatter_nd_update_v2_tiling.cpp"
-    cp -a \
-        "${SCATTER_OVERRIDES_DIR}/op_kernel/scatter_nd_update_large_index.h" \
-        "${scatter_staging_dir}/op_kernel/scatter_nd_update_large_index.h"
-
     for entry_name in \
         attention \
         common \
@@ -171,7 +140,7 @@ function build_cann_ops() {
         if [[ "${entry_name}" == "moe" ]]; then
             for moe_entry in "${VLLM_ASCEND_CSRC}/moe"/*; do
                 entry_name="$(basename "${moe_entry}")"
-                if [[ "${entry_name}" != "CMakeLists.txt" && "${entry_name}" != "scatter_nd_update_v2" ]]; then
+                if [[ "${entry_name}" != "CMakeLists.txt" ]]; then
                     sync_symlink "${moe_entry}" "${staging_dir}/moe/${entry_name}"
                 fi
             done
@@ -235,7 +204,6 @@ function collect_cann_vendors() {
 
 prepare_vllm_ascend_sources
 export ASCEND_HOME_PATH="${CANN_HOME}"
-build_tokenspeed_extension
 build_cann_ops
 build_vllm_ascend_extension
 collect_cann_vendors

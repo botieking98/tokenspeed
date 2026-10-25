@@ -58,8 +58,7 @@ from tokenspeed_kernel import (
     dsv4_npu_quant_lightning_indexer_metadata as npu_quant_lightning_indexer_metadata,
     dsv4_npu_rms_norm_dynamic_quant as npu_rms_norm_dynamic_quant,
     dsv4_npu_moe_gating_top_k_hash as npu_moe_gating_top_k_hash,
-    npu_scatter_nd_update,
-    npu_scatter_nd_update_v2,
+    npu_scatter_nd_update_sk,
     dsv4_npu_sparse_attn_sharedkv_metadata as npu_sparse_attn_sharedkv_metadata,
 )
 
@@ -455,6 +454,8 @@ class NpuDsaRequestMetadata:
     swa_slot_mapping: torch.Tensor
     sas_metadata: dict[int, torch.Tensor]
     qli_metadata: torch.Tensor | None
+    qli_seqused_k: torch.Tensor
+    qli_cmp_residual_k: torch.Tensor
     default_cos: dict[int, torch.Tensor]
     default_sin: dict[int, torch.Tensor]
     compress_cos: torch.Tensor
@@ -528,6 +529,18 @@ class NpuDsaMetadataBuilder:
         self.local_qli_buffer = torch.zeros(
             DSA_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device
         )
+        self.qli_seqused_buffer = torch.zeros(
+            max(1, int(max_batch_size)), dtype=torch.int32, device=device
+        )
+        self.qli_cmp_residual_buffer = torch.zeros(
+            max(1, int(max_batch_size)), dtype=torch.int32, device=device
+        )
+        self.local_qli_seqused_buffer = torch.zeros(
+            max(1, int(max_batch_size)), dtype=torch.int32, device=device
+        )
+        self.local_qli_cmp_residual_buffer = torch.zeros(
+            max(1, int(max_batch_size)), dtype=torch.int32, device=device
+        )
         self.local_query_start_loc_buffer = torch.zeros(
             max(1, int(max_batch_size)) + 1,
             dtype=torch.int32,
@@ -543,6 +556,27 @@ class NpuDsaMetadataBuilder:
             max(1, int(max_batch_size)), dtype=torch.int32, device=device
         )
         self.block_table_buffers: dict[str, torch.Tensor] = {}
+
+    def _build_qli_lengths(
+        self,
+        seq_lens: torch.Tensor,
+        num_reqs: int,
+        seqused_buffer: torch.Tensor,
+        residual_buffer: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_lens_i32 = seq_lens
+        if seq_lens_i32.dtype != torch.int32:
+            seq_lens_i32 = seq_lens_i32.to(torch.int32)
+        seqused_k = seqused_buffer[:num_reqs]
+        cmp_residual_k = residual_buffer[:num_reqs]
+        torch.div(
+            seq_lens_i32,
+            4,
+            rounding_mode="floor",
+            out=seqused_k,
+        )
+        torch.remainder(seq_lens_i32, 4, out=cmp_residual_k)
+        return seqused_k, cmp_residual_k
 
     def _block_table(
         self, metadata: Any, group_id: str
@@ -703,22 +737,32 @@ class NpuDsaMetadataBuilder:
             self.local_sas_buffers[ratio].copy_(built)
 
         local_qli_metadata = None
+        local_qli_seqused_k = torch.empty(0, dtype=torch.int32, device=self.device)
+        local_qli_cmp_residual_k = torch.empty(
+            0, dtype=torch.int32, device=self.device
+        )
         if 4 in self.compress_ratios:
+            local_qli_seqused_k, local_qli_cmp_residual_k = self._build_qli_lengths(
+                local_seq_lens,
+                num_reqs,
+                self.local_qli_seqused_buffer,
+                self.local_qli_cmp_residual_buffer,
+            )
             built = npu_quant_lightning_indexer_metadata(
                 num_heads_q=self.index_n_heads,
                 num_heads_k=1,
                 head_dim=self.index_head_dim,
-                query_quant_mode=0,
-                key_quant_mode=0,
-                actual_seq_lengths_query=local_query_start_loc[1:],
-                actual_seq_lengths_key=local_seq_lens,
+                topk=self.index_topk,
+                quant_mode=2,
+                cu_seqlens_q=local_query_start_loc,
+                seqused_k=local_qli_seqused_k,
+                cmp_residual_k=local_qli_cmp_residual_k,
                 batch_size=num_reqs,
                 max_seqlen_q=max_local_query_len,
-                max_seqlen_k=max_local_seq_len,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
+                max_seqlen_k=max(1, max_local_seq_len // 4),
+                layout_q="TND",
+                layout_k="PA_BBND",
+                mask_mode=3,
                 cmp_ratio=4,
                 device=str(self.device),
             )
@@ -795,6 +839,8 @@ class NpuDsaMetadataBuilder:
             swa_slot_mapping=swa_slots,
             sas_metadata=self.local_sas_buffers,
             qli_metadata=local_qli_metadata,
+            qli_seqused_k=local_qli_seqused_k,
+            qli_cmp_residual_k=local_qli_cmp_residual_k,
             default_cos=local_default_cos,
             default_sin=local_default_sin,
             compress_cos=F.pad(
@@ -927,22 +973,30 @@ class NpuDsaMetadataBuilder:
             sas_metadata[ratio] = self.sas_buffers[ratio]
 
         qli_metadata = None
+        qli_seqused_k = torch.empty(0, dtype=torch.int32, device=self.device)
+        qli_cmp_residual_k = torch.empty(0, dtype=torch.int32, device=self.device)
         if 4 in self.compress_ratios:
+            qli_seqused_k, qli_cmp_residual_k = self._build_qli_lengths(
+                seq_lens,
+                num_reqs,
+                self.qli_seqused_buffer,
+                self.qli_cmp_residual_buffer,
+            )
             built = npu_quant_lightning_indexer_metadata(
                 num_heads_q=self.index_n_heads,
                 num_heads_k=1,
                 head_dim=self.index_head_dim,
-                query_quant_mode=0,
-                key_quant_mode=0,
-                actual_seq_lengths_query=query_start_loc[1:].clone(),
-                actual_seq_lengths_key=seq_lens.clone(),
+                topk=self.index_topk,
+                quant_mode=2,
+                cu_seqlens_q=query_start_loc,
+                seqused_k=qli_seqused_k,
+                cmp_residual_k=qli_cmp_residual_k,
                 batch_size=num_reqs,
                 max_seqlen_q=max_query_len,
-                max_seqlen_k=max_seq_len,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
+                max_seqlen_k=max(1, max_seq_len // 4),
+                layout_q="TND",
+                layout_k="PA_BBND",
+                mask_mode=3,
                 cmp_ratio=4,
                 device=str(self.device),
             )
@@ -1033,6 +1087,8 @@ class NpuDsaMetadataBuilder:
             swa_slot_mapping=swa_slots,
             sas_metadata=sas_metadata,
             qli_metadata=qli_metadata,
+            qli_seqused_k=qli_seqused_k,
+            qli_cmp_residual_k=qli_cmp_residual_k,
             default_cos=layer_cos,
             default_sin=layer_sin,
             compress_cos=compressed_cos,
@@ -1071,6 +1127,7 @@ class NpuCompressor(nn.Module):
         self.wkv = NpuBfloat16Linear(config.hidden_size, self.coff * head_dim)
         self.wgate = NpuBfloat16Linear(config.hidden_size, self.coff * head_dim)
         self.norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+        self.norm.weight.data = self.norm.weight.data.to(torch.float32)
 
     def forward(
         self,
@@ -1246,10 +1303,10 @@ class NpuIndexer(nn.Module):
             kv_scale = kv_scale.unsqueeze(-1).to(torch.float16)
             if kv_scale.ndim < 4:
                 kv_scale = kv_scale.unsqueeze(-1)
-            npu_scatter_nd_update_v2(
+            npu_scatter_nd_update_sk(
                 pool.get_indexer_kv_buffer_2d(layer_id), slot_mapping, quant_kv
             )
-            npu_scatter_nd_update_v2(
+            npu_scatter_nd_update_sk(
                 pool.get_indexer_scale_buffer(layer_id), slot_mapping, kv_scale
             )
 
@@ -1277,18 +1334,18 @@ class NpuIndexer(nn.Module):
             weights.to(torch.float16),
             q_scale.to(torch.float16),
             pool.get_indexer_scale_buffer(layer_id).squeeze(-2).to(torch.float16),
-            query_quant_mode=0,
-            key_quant_mode=0,
-            actual_seq_lengths_query=request_metadata.query_start_loc[1:],
-            actual_seq_lengths_key=request_metadata.seq_lens,
+            topk=self.index_topk,
+            quant_mode=2,
+            cu_seqlens_q=request_metadata.query_start_loc,
+            seqused_k=request_metadata.qli_seqused_k,
+            cmp_residual_k=request_metadata.qli_cmp_residual_k,
             block_table=request_metadata.compressed_block_tables[4],
             metadata=request_metadata.qli_metadata,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
             cmp_ratio=4,
-            return_value=False,
+            return_value=0,
         )
         topk_indices = _normalize_topk_indices(topk_indices)
         if self.topk_indices_buffer is not None:
@@ -1508,7 +1565,7 @@ class NpuAttention(nn.Module):
                 rotary_mode="interleave",
                 partial_slice=[self.nope_head_dim, self.head_dim],
             )
-            npu_scatter_nd_update_v2(
+            npu_scatter_nd_update_sk(
                 pool.get_swa_kv_buffer(self.layer_id),
                 metadata.swa_slot_mapping,
                 kv,
@@ -1528,7 +1585,7 @@ class NpuAttention(nn.Module):
                     state_block_table,
                 )
                 if compressed_kv.numel() > 0:
-                    npu_scatter_nd_update_v2(
+                    npu_scatter_nd_update_sk(
                         pool.get_compressed_kv_buffer_2d(self.layer_id),
                         compressed_slots,
                         compressed_kv,
@@ -2054,6 +2111,7 @@ class NpuMoE(nn.Module):
             expert_token_nums=self.experts.fused_expert_token_nums,
             x_active_mask=active_mask,
             swiglu_limit=self.experts.swiglu_limit,
+            world_size=self.mapping.moe.tp_ep_size,
         )
         return routed
 
